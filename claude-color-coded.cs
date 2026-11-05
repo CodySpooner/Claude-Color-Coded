@@ -1,12 +1,13 @@
-// Claude Color Coded: right-click a group heading in the Claude desktop app's sidebar and choose Select color.
+// Claude Color Coded: right-click a group heading in the Claude desktop app's sidebar and choose Select font color or Select color.
 //
 // This is a separate helper, not a change to the app. It reads heading names and positions through
-// Windows UI Automation (the API screen readers use) and draws tinted strips over them in its own
-// click-through window. Select color is its own window too, drawn to look like part of the app's menu.
-// The only thing it saves is the color you pick for each group name.
+// Windows UI Automation (the API screen readers use) and draws over them in its own click-through
+// windows: tinted strips, and recolored copies of the names. The color choices are its own windows too, drawn to look like part of the app's menu.
+// The only thing it saves is the colors you pick for each group name.
 //
 // Build: build.cmd    Run: ClaudeColorCoded.exe    Quit: its tray icon    Diagnose: ClaudeColorCoded.exe --check
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -46,6 +47,7 @@ static class Native {
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out RECT rect);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(IntPtr window, uint affinity);
     [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint ms);
     [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint ms);
     [DllImport("user32.dll")] public static extern bool UpdateLayeredWindow(IntPtr window, IntPtr screen, ref POINT at, ref SIZE size, IntPtr source, ref POINT from, int key, ref Blend blend, int flags);
@@ -55,11 +57,27 @@ static class Native {
     [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr dc, IntPtr item);
     [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr item);
     [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr dc);
+    [StructLayout(LayoutKind.Sequential)] public struct BitmapInfo { public int Size, Width, Height; public short Planes, Bits; public int Compression, ImageSize, XPerMeter, YPerMeter, Used, Important, Spare; }
+    [DllImport("gdi32.dll")] public static extern IntPtr CreateDIBSection(IntPtr dc, ref BitmapInfo info, uint usage, out IntPtr bits, IntPtr section, uint offset);
+    [DllImport("gdi32.dll")] public static extern bool BitBlt(IntPtr to, int x, int y, int width, int height, IntPtr from, int fromX, int fromY, uint operation);
+    [DllImport("gdi32.dll")] public static extern bool GdiFlush();
+    [DllImport("user32.dll")] public static extern bool ValidateRect(IntPtr window, IntPtr rect);
+    [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)] public static extern unsafe int memcmp(int* a, int* b, UIntPtr bytes);
+    [DllImport("dxgi.dll")] public static extern int CreateDXGIFactory1(ref Guid id, out IntPtr factory);
+    [DllImport("d3d11.dll")] public static extern int D3D11CreateDevice(IntPtr adapter, int driver, IntPtr software, uint flags, IntPtr levels, uint levelCount, uint version, out IntPtr device, out int level, out IntPtr context);
 }
 
 class Row {
     public string Name;
     public Rectangle Bounds;
+    public AutomationElement Element; // The heading's row in the app, for finding its name's letters.
+}
+
+// Where a heading's letters sit in its row. Known even for rows scrolled out of view, so their names can be colored the moment they come into it.
+struct NamePlace {
+    public Rectangle Box; // From the row's corner.
+    public Size RowSize; // Another size means a resized sidebar or a zoom, so it gets looked up again.
+    public Rectangle On(Rectangle row) { return new Rectangle(row.X + Box.X, row.Y + Box.Y, Box.Width, Box.Height); }
 }
 
 class Snapshot {
@@ -72,8 +90,9 @@ class Snapshot {
         return Window + "|" + Area + "|" + string.Join(";", Rows.Select(r => r.Name + r.Bounds));
     }
 
-    public Row RowAt(Point point) {
-        return Area.Contains(point) ? Rows.FirstOrDefault(r => r.Bounds.Contains(point)) : null;
+    // The offset is how far the rows have scrolled since this was read.
+    public Row RowAt(Point point, int offset) {
+        return Area.Contains(point) ? Rows.FirstOrDefault(r => r.Bounds.Contains(point.X, point.Y - offset)) : null;
     }
 
     // True when every heading moved the same distance, which only scrolling does. Expanding a group moves some and not others.
@@ -87,35 +106,61 @@ class Snapshot {
     }
 }
 
-// Follows a scroll by comparing the sidebar's pixels between frames, because UI Automation only reports
-// new positions about 8 times a second. It runs only while the sidebar moves, and pixels are hashed in memory, never kept.
-class ScrollTracker {
+// Follows the sidebar when it moves. A window drawn over the app can only ever land a frame or two after what it covers, so while the sidebar moves the colors don't float over it at all:
+// each new frame of the app's pixels is read, colored, and shown as one picture over the sidebar, so text and color can't separate. Clicks still pass through to the real app beneath.
+// It runs only during a scroll and for a moment after a click in the sidebar, and pixels are kept in memory for that long and never saved.
+unsafe class ScrollTracker {
     const int QuietMs = 300, MaxShift = 300, MinMatches = 20;
+    const int FirstFrameMs = 30, FrameWaitMs = 20, GiveUpMs = 100; // A frame that fits no scroll isn't shown. If that lasts, it's a layout change and automation's positions take over.
+    public const int EdgeInset = 4;
+    const int SideInset = 12, MatchWidth = 150; // The part of each line compared between frames, clear of the scrollbar and of the buttons that appear on hovering.
+    // A click in the sidebar can move rows, as expanding a group does. Measured: the rows jump in a single frame 35 to 65 ms after the click. Automation has their new places up to 50 ms after that, and can report the old ones again first.
+    // So for a moment after a click each frame is checked against where the colored rows should be. One that doesn't fit isn't shown until automation offers positions that do, and then frame and positions go up together.
+    const int ClickWatchMs = 400, HoldMs = 250;
+    const int StrayAnywhere = 60; // More lines of text than this changing means rows moved. A click's highlights alone change about 30.
+    const uint SRCCOPY = 0x00CC0020, WDA_NONE = 0, WDA_EXCLUDEFROMCAPTURE = 0x11;
     readonly AutoResetEvent wake = new AutoResetEvent(false);
     readonly Stopwatch clock = Stopwatch.StartNew();
-    readonly Action moved;
+    readonly Action ended;
+    readonly Action<Snapshot> adopted;
     readonly object gate = new object();
-    Rectangle column;
-    volatile int lastMotion;
+    DesktopFrames frames;
+    Point screenAt = new Point(int.MinValue, 0), triedAt = new Point(int.MinValue, 0);
+    Scene next, offered;
+    volatile int lastMotion, clickedAt;
+    volatile bool stop, watchLayout, gaveUp;
     public readonly AutoResetEvent PollNow = new AutoResetEvent(false);
     public volatile bool Capturing;
     public volatile bool Active; // Stays on after capturing stops, until automation has been read again.
+    public volatile bool Holding; // Keeping the last picture up, as the newest frame doesn't fit the positions known.
     public volatile int Offset;
-    public volatile int Lead; // What was just measured is out of date by the time it's on screen, so strips are drawn this far ahead.
-    // How long a strip takes to reach the screen after its frame was read. Measured on a 165 Hz screen at 300-1000 px/s: 0 left strips 6 px behind, 7 left 1 px.
-    // ponytail: fixed for that screen. A 60 Hz screen would likely need more; work it out from the refresh rate if that one gets used.
-    public static double LeadMs = 7;
 
-    public ScrollTracker(Action moved) {
-        this.moved = moved;
+    public ScrollTracker(Action ended, Action<Snapshot> adopted) {
+        this.ended = ended;
+        this.adopted = adopted;
         new Thread(Run) { IsBackground = true }.Start();
     }
 
-    public void Start(Rectangle list) {
+    // Getting ready to read a screen takes 200 ms, too long to do on the first wheel notch, so it's done as soon as the sidebar is seen on that screen.
+    public void Prepare(Point at) {
+        lock (gate) screenAt = at;
+        wake.Set();
+    }
+
+    public bool WatchingLayout { get { return watchLayout && clock.ElapsedMilliseconds - clickedAt < ClickWatchMs; } }
+
+    // Positions from automation, to use once a frame agrees with them.
+    public void Offer(Scene scene) { offered = scene; }
+
+    // Only ever called on the app's main thread, as Stop is.
+    public void Start(Func<Scene> build, bool clicked) {
         lastMotion = (int)clock.ElapsedMilliseconds;
+        watchLayout = clicked; // A wheel notch ends the watch: from then on automation's positions are behind the pixels again.
+        if (clicked) { clickedAt = lastMotion; gaveUp = false; }
         lock (gate) {
             if (Capturing) return;
-            column = new Rectangle(list.X + 12, list.Y + 4, Math.Min(150, list.Width - 24), list.Height - 8);
+            next = build();
+            stop = false;
             Capturing = true;
             Active = true;
         }
@@ -123,63 +168,159 @@ class ScrollTracker {
         PollNow.Set();
     }
 
+    // Other buttons can open menus and a drag moves the window, and the picture must not sit over that.
+    public void Stop() { stop = true; }
+
     // Called once a read that began after the scroll stopped is in, so automation's positions can be trusted again.
     public void Finish() {
         lock (gate) { if (!Capturing) Active = false; }
     }
 
+    public static void Exclude(IntPtr stripsWindow, IntPtr namesWindow, bool excluded) {
+        Native.SetWindowDisplayAffinity(stripsWindow, excluded ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+        Native.SetWindowDisplayAffinity(namesWindow, excluded ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+    }
+
     void Run() {
         while (true) {
             wake.WaitOne();
-            // ponytail: the screen can't be read on the lock screen. Automation's positions take over once this stops.
-            try { Track(); } catch (Exception) { }
-            Capturing = false;
-        }
-    }
-
-    void Track() {
-        int width = column.Width, height = column.Height;
-        Lead = 0;
-        var pixels = new int[width * height];
-        int[] reference = new int[height], current = new int[height];
-        var hasText = new bool[height];
-        using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppRgb))
-        using (Graphics graphics = Graphics.FromImage(bitmap)) {
-            ReadLines(bitmap, graphics, pixels, reference, hasText);
-            double lastMatch = clock.Elapsed.TotalMilliseconds;
-            while (clock.ElapsedMilliseconds - lastMotion < QuietMs) {
-                ReadLines(bitmap, graphics, pixels, current, hasText);
-                int shift;
-                // If a frame matches nothing, the last good frame stays the reference, so that frame's motion is still counted by the next match.
-                if (FindShift(reference, current, hasText, out shift)) {
-                    int[] swap = reference; reference = current; current = swap;
-                    double now = clock.Elapsed.TotalMilliseconds;
-                    if (shift != 0 || Lead != 0) { // A still frame after motion takes the lead back off, so strips land exactly.
-                        Offset += shift;
-                        Lead = (int)Math.Round(shift * LeadMs / Math.Max(now - lastMatch, 1)); // Speed, not the raw shift: one shift can span several frames.
-                        if (shift != 0) lastMotion = (int)clock.ElapsedMilliseconds;
-                        moved();
-                    }
-                    lastMatch = now;
-                }
-                // No sleep here: Thread.Sleep(1) really takes 15.5 ms on Windows, which capped this at about 45 updates a second.
-                // ponytail: uses more CPU while the sidebar moves, and only then.
+            Point at;
+            Scene scene;
+            lock (gate) { at = screenAt; scene = next; next = null; }
+            if (at != triedAt && at.X != int.MinValue && (frames == null || !frames.Covers(at))) {
+                triedAt = at;
+                try { frames = DesktopFrames.Open(at); } catch (Exception) { frames = null; }
             }
+            if (scene == null) continue;
+            // ponytail: the screen can't be read on the lock screen. Automation's positions take over once this stops.
+            try { Track(scene); } catch (Exception) { frames = null; triedAt = new Point(int.MinValue, 0); }
+            Capturing = false;
+            ended();
         }
     }
 
-    void ReadLines(Bitmap bitmap, Graphics graphics, int[] pixels, int[] hashes, bool[] hasText) {
-        // CopyFromScreen leaves out layered windows by default, so the overlay's own strips aren't in what's compared.
-        graphics.CopyFromScreen(column.Location, Point.Empty, column.Size);
-        BitmapData data = bitmap.LockBits(new Rectangle(Point.Empty, column.Size), ImageLockMode.ReadOnly, bitmap.PixelFormat);
-        Marshal.Copy(data.Scan0, pixels, 0, pixels.Length);
-        bitmap.UnlockBits(data);
+    void Track(Scene scene) {
+        Rectangle part = scene.Part;
+        int width = part.Width, height = part.Height, lines = height - 2 * EdgeInset;
+        if (width <= 2 * SideInset || lines <= 0) return;
+        int[] reference = new int[lines], current = new int[lines];
+        var hasText = new bool[lines];
+        IntPtr screen = Native.GetDC(IntPtr.Zero), target = Native.GetDC(scene.NamesWindow);
+        // Measured: left out like this, our own windows never appear in what's read, and it takes effect at once. A screen recording also loses the colors for the length of a scroll.
+        Exclude(scene.StripsWindow, scene.NamesWindow, true);
+        bool duplicating = frames != null && frames.Covers(part) && frames.Start(part.Size);
+        var raw = new PixelBuffer(width, height);
+        var last = new PixelBuffer(width, height);
+        var picture = new PixelBuffer(width, height);
+        try {
+            // The first frame comes back blank and a new one only arrives when something redraws, so nudge one along. This has to be the sidebar before it moves, as everything is measured from it.
+            if (duplicating) Native.BitBlt(target, 0, 0, 1, 1, target, 0, 0, SRCCOPY);
+            int began = (int)clock.ElapsedMilliseconds;
+            while (!NextFrame(duplicating, part, raw, screen))
+                if (duplicating && clock.ElapsedMilliseconds - began > FirstFrameMs) { frames.Stop(); duplicating = false; }
+            Hash(raw.Pixels, width, reference, hasText);
+            offered = null;
+            scene.Prepare();
+            scene.Names.Mirroring = true;
+            scene.Bake(raw.Pixels, picture.Pixels, Offset);
+            Present(scene, target, picture);
+            PixelBuffer swap = raw; raw = last; last = swap;
+            var looks = new Dictionary<string, int[]>();
+            scene.Remember(looks, reference, hasText, Offset, Cursor.Position);
+            Scene waiting = null;
+            long lastMatch = clock.ElapsedMilliseconds, heldAt = 0;
+
+            while (!stop && (Holding || clock.ElapsedMilliseconds - lastMotion < QuietMs)) {
+                Scene offer = Interlocked.Exchange(ref offered, null);
+                if (offer != null) {
+                    if (offer.Part != part) break;
+                    offer.Prepare();
+                    waiting = offer;
+                }
+                // ponytail: a wheel notch during a hold isn't counted, so if automation can't catch up the colors can be off for the rest of that scroll, until it stops. Takes a click and a notch within 100 ms.
+                bool late = Holding && clock.ElapsedMilliseconds - heldAt > HoldMs;
+                if (waiting != null && (late || waiting.Fits(looks, reference, 0, Cursor.Position))) {
+                    scene = waiting;
+                    waiting = null;
+                    Offset = 0;
+                    scene.Remember(looks, reference, hasText, 0, Cursor.Position);
+                    adopted(scene.From);
+                    Holding = false;
+                    lastMatch = clock.ElapsedMilliseconds;
+                    lastMotion = (int)lastMatch;
+                    scene.Bake(last.Pixels, picture.Pixels, Offset);
+                    Present(scene, target, picture);
+                } else if (late) { // Something that won't settle, like a row fading. One hold per click, so it can't keep the picture still.
+                    gaveUp = true;
+                    Holding = false;
+                    lastMatch = clock.ElapsedMilliseconds;
+                    scene.Bake(last.Pixels, picture.Pixels, Offset);
+                    Present(scene, target, picture);
+                }
+                if (!NextFrame(duplicating, part, raw, screen)) continue;
+                if (Native.memcmp(raw.Pixels, last.Pixels, new UIntPtr((uint)(width * height * 4))) == 0) continue; // Something else on screen changed.
+                Hash(raw.Pixels, width, current, hasText);
+                int shift, stray;
+                bool fits = FindShift(reference, current, hasText, out shift, out stray);
+                int[] swapLines;
+                if (Holding || (!gaveUp && WatchingLayout)) {
+                    int at = Holding ? Offset : Offset + shift; // While holding, the lines compared against have already moved on with the frames.
+                    // A big change with a colored row out of view below could bring that row in, which only automation can tell.
+                    bool small = !Holding && stray <= StrayAnywhere;
+                    if (!fits || !scene.Fits(looks, current, at, Cursor.Position) || (!small && scene.MoreBelow(at, current.Length))) {
+                        if (!Holding) { Holding = true; heldAt = clock.ElapsedMilliseconds; PollNow.Set(); }
+                        swapLines = reference; reference = current; current = swapLines;
+                        swap = raw; raw = last; last = swap; // The newest frame, ready for when the positions come.
+                        continue;
+                    }
+                    if (Holding) { Holding = false; shift = 0; }
+                }
+                // If a frame matches nothing, the last good frame stays both the reference and what's showing, so that frame's motion is still counted by the next match.
+                if (!fits) {
+                    if (clock.ElapsedMilliseconds - lastMatch > GiveUpMs) break;
+                    continue;
+                }
+                swapLines = reference; reference = current; current = swapLines;
+                lastMatch = clock.ElapsedMilliseconds;
+                if (shift != 0) { Offset += shift; lastMotion = (int)lastMatch; }
+                scene.Bake(raw.Pixels, picture.Pixels, Offset);
+                Present(scene, target, picture);
+                swap = raw; raw = last; last = swap;
+            }
+            if (!Holding) scene.Settle(last.Pixels, picture.Pixels, Offset); // While holding, the last frame isn't what's showing.
+        } finally {
+            Holding = false;
+            if (duplicating) frames.Stop();
+            raw.Dispose();
+            last.Dispose();
+            picture.Dispose();
+            Native.ReleaseDC(IntPtr.Zero, screen);
+            Native.ReleaseDC(scene.NamesWindow, target);
+        }
+    }
+
+    bool NextFrame(bool duplicating, Rectangle part, PixelBuffer into, IntPtr screen) {
+        if (duplicating) return frames.Next(FrameWaitMs, part, into.Pixels);
+        // Windows' older way, used when Desktop Duplication isn't available, as on a rotated screen. Measured at 11 ms a read, so about 80 frames a second.
+        Native.BitBlt(into.Dc, 0, 0, part.Width, part.Height, screen, part.X, part.Y, SRCCOPY);
+        Native.GdiFlush();
+        return true;
+    }
+
+    static void Present(Scene scene, IntPtr target, PixelBuffer picture) {
+        Native.BitBlt(target, scene.Part.X - scene.WindowAt.X, scene.Part.Y - scene.WindowAt.Y, scene.Part.Width, scene.Part.Height, picture.Dc, 0, 0, SRCCOPY);
+        Native.GdiFlush();
+    }
+
+    static void Hash(int* pixels, int width, int[] hashes, bool[] hasText) {
+        int span = Math.Min(MatchWidth, width - 2 * SideInset);
         for (int y = 0; y < hashes.Length; y++) {
-            int start = y * column.Width, first = pixels[start], hash = 17;
+            int* line = pixels + (y + EdgeInset) * width + SideInset;
+            int first = line[0], hash = 17;
             bool text = false;
-            for (int i = start; i < start + column.Width; i++) {
-                hash = hash * 31 + pixels[i];
-                if (pixels[i] != first) text = true;
+            for (int i = 0; i < span; i++) {
+                hash = hash * 31 + line[i];
+                if (line[i] != first) text = true;
             }
             hashes[y] = hash;
             hasText[y] = text;
@@ -187,7 +328,7 @@ class ScrollTracker {
     }
 
     // Finds how far the lines moved since the reference frame, positive being down. Blank lines match anywhere, so only lines with text count.
-    public static bool FindShift(int[] reference, int[] current, bool[] hasText, out int shift) {
+    public static bool FindShift(int[] reference, int[] current, bool[] hasText, out int shift, out int stray) {
         int height = current.Length, bestHits = -1, bestSeen = 0;
         shift = 0;
         for (int s = -MaxShift; s <= MaxShift; s++) {
@@ -199,10 +340,374 @@ class ScrollTracker {
             }
             if (hits > bestHits || (hits == bestHits && Math.Abs(s) < Math.Abs(shift))) { bestHits = hits; bestSeen = seen; shift = s; }
         }
+        stray = bestSeen - bestHits; // Lines of text that don't fit that shift.
         return bestHits >= MinMatches && bestHits * 2 >= bestSeen;
     }
 }
 
+// Pixels that both this code and Windows' drawing calls can use directly.
+unsafe sealed class PixelBuffer : IDisposable {
+    public readonly IntPtr Dc;
+    public readonly int* Pixels;
+    readonly IntPtr bitmap, original;
+
+    public PixelBuffer(int width, int height) {
+        var info = new Native.BitmapInfo { Size = 40, Width = width, Height = -height, Planes = 1, Bits = 32 }; // A negative height keeps the top line first.
+        Dc = Native.CreateCompatibleDC(IntPtr.Zero);
+        IntPtr bits;
+        bitmap = Native.CreateDIBSection(Dc, ref info, 0, out bits, IntPtr.Zero, 0);
+        original = Native.SelectObject(Dc, bitmap);
+        Pixels = (int*)bits;
+    }
+
+    public void Dispose() {
+        Native.SelectObject(Dc, original);
+        Native.DeleteObject(bitmap);
+        Native.DeleteDC(Dc);
+    }
+}
+
+// Windows' Desktop Duplication: each new screen image, from the graphics card. Measured at 0.5 ms to copy the sidebar and 160 frames a second, where the older way takes 11 ms a read.
+// Windows' C# compiler has no DirectX definitions, so its objects are called through their method tables. The numbers are each method's place in its table, from the DirectX headers.
+// Kept running only while the picture is up: while it runs, Windows can't use some of its faster ways of drawing other apps.
+// ponytail: on an HDR screen these frames may not match the screen's colors exactly. Tell Open to return null there if that gets seen.
+unsafe class DesktopFrames {
+    delegate uint ReleaseFn(IntPtr self);
+    delegate int QueryFn(IntPtr self, ref Guid id, out IntPtr result);
+    delegate int EnumFn(IntPtr self, uint index, out IntPtr result);
+    delegate int DescFn(IntPtr self, byte* description);
+    delegate int DuplicateFn(IntPtr self, IntPtr device, out IntPtr duplication);
+    delegate int AcquireFn(IntPtr self, uint waitMs, byte* info, out IntPtr resource);
+    delegate int ReleaseFrameFn(IntPtr self);
+    delegate int CreateTextureFn(IntPtr self, uint* description, IntPtr initial, out IntPtr texture);
+    delegate void CopyRegionFn(IntPtr self, IntPtr to, uint toSub, uint x, uint y, uint z, IntPtr from, uint fromSub, uint* box);
+    delegate int MapFn(IntPtr self, IntPtr resource, uint sub, uint type, uint flags, IntPtr* mapped);
+    delegate void UnmapFn(IntPtr self, IntPtr resource, uint sub);
+    const int NoNewFrame = unchecked((int)0x887A0027), IdentityRotation = 1;
+
+    IntPtr device, context, output, staging, duplication;
+    Rectangle bounds;
+    AcquireFn acquire;
+    ReleaseFrameFn releaseFrame;
+    CopyRegionFn copyRegion;
+    MapFn map;
+    UnmapFn unmap;
+
+    static T Method<T>(IntPtr self, int place) where T : class {
+        return (T)(object)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(Marshal.ReadIntPtr(self), place * IntPtr.Size), typeof(T));
+    }
+
+    static void Release(IntPtr self) { if (self != IntPtr.Zero) Method<ReleaseFn>(self, 2)(self); }
+
+    static IntPtr Query(IntPtr self, string id) {
+        Guid guid = new Guid(id);
+        IntPtr result;
+        Check(Method<QueryFn>(self, 0)(self, ref guid, out result));
+        return result;
+    }
+
+    static void Check(int result) { if (result < 0) throw new ExternalException("DirectX", result); }
+
+    // For the screen holding this point. Null where it can't work, as on a rotated screen, whose frames come sideways.
+    public static DesktopFrames Open(Point at) {
+        Guid factoryId = new Guid("770aae78-f26f-4dba-a829-253c83d1b387"); // IDXGIFactory1
+        IntPtr factory, adapter;
+        Check(Native.CreateDXGIFactory1(ref factoryId, out factory));
+        DesktopFrames found = null;
+        for (uint a = 0; found == null && Method<EnumFn>(factory, 12)(factory, a, out adapter) >= 0; a++) {
+            IntPtr candidate;
+            for (uint o = 0; found == null && Method<EnumFn>(adapter, 7)(adapter, o, out candidate) >= 0; o++) {
+                byte* description = stackalloc byte[128];
+                Method<DescFn>(candidate, 7)(candidate, description);
+                int* corners = (int*)(description + 64); // After the 32-character device name.
+                Rectangle bounds = Rectangle.FromLTRB(corners[0], corners[1], corners[2], corners[3]);
+                if (bounds.Contains(at) && *(int*)(description + 84) == IdentityRotation) {
+                    found = new DesktopFrames { bounds = bounds };
+                    int level;
+                    Check(Native.D3D11CreateDevice(adapter, 0, IntPtr.Zero, 0, IntPtr.Zero, 0, 7, out found.device, out level, out found.context));
+                    found.output = Query(candidate, "00cddea8-939b-4b83-a340-a685226666cc"); // IDXGIOutput1
+                    found.copyRegion = Method<CopyRegionFn>(found.context, 46);
+                    found.map = Method<MapFn>(found.context, 14);
+                    found.unmap = Method<UnmapFn>(found.context, 15);
+                }
+                Release(candidate);
+            }
+            Release(adapter);
+        }
+        Release(factory);
+        return found;
+    }
+
+    public bool Covers(Point at) { return bounds.Contains(at); }
+    public bool Covers(Rectangle part) { return bounds.Contains(part); }
+
+    public bool Start(Size size) {
+        uint* description = stackalloc uint[11];
+        description[0] = (uint)size.Width; description[1] = (uint)size.Height; description[2] = 1; description[3] = 1;
+        description[4] = 87; description[5] = 1; description[6] = 0; // 32-bit BGRA, no multisampling.
+        description[7] = 3; description[8] = 0; description[9] = 0x20000; description[10] = 0; // Readable by this code.
+        if (Method<CreateTextureFn>(device, 5)(device, description, IntPtr.Zero, out staging) < 0) return false;
+        if (Method<DuplicateFn>(output, 22)(output, device, out duplication) < 0) { Release(staging); staging = IntPtr.Zero; return false; }
+        acquire = Method<AcquireFn>(duplication, 8);
+        releaseFrame = Method<ReleaseFrameFn>(duplication, 14);
+        return true;
+    }
+
+    public void Stop() {
+        Release(duplication);
+        Release(staging);
+        duplication = staging = IntPtr.Zero;
+    }
+
+    // False if no new picture of the screen came in time. Only the mouse moving also counts as none, and that's what the blank first frame looks like.
+    public bool Next(int waitMs, Rectangle part, int* pixels) {
+        byte* info = stackalloc byte[64];
+        IntPtr resource;
+        int result = acquire(duplication, (uint)waitMs, info, out resource);
+        if (result == NoNewFrame) return false;
+        Check(result);
+        bool hasPicture = *(long*)info != 0; // When the screen was last updated.
+        if (hasPicture) {
+            IntPtr texture = Query(resource, "6f15aaf2-d208-4e89-9ab4-489535d34f9c"); // ID3D11Texture2D
+            uint* box = stackalloc uint[6];
+            box[0] = (uint)(part.X - bounds.X); box[1] = (uint)(part.Y - bounds.Y); box[2] = 0;
+            box[3] = box[0] + (uint)part.Width; box[4] = box[1] + (uint)part.Height; box[5] = 1;
+            copyRegion(context, staging, 0, 0, 0, 0, texture, 0, box);
+            IntPtr* mapped = stackalloc IntPtr[2];
+            Check(map(context, staging, 0, 1, 0, mapped));
+            byte* from = (byte*)mapped[0];
+            int pitch = *(int*)(mapped + 1), lineBytes = part.Width * 4;
+            for (int y = 0; y < part.Height; y++) Buffer.MemoryCopy(from + y * pitch, pixels + y * part.Width, lineBytes, lineBytes);
+            unmap(context, staging, 0);
+            Release(texture);
+        }
+        Release(resource);
+        releaseFrame(duplication);
+        return hasPicture;
+    }
+}
+
+// What's colored in the sidebar for the length of one scroll, and how to paint it into a frame of the app's pixels. All of it is worked out the same way the separate windows' pixels are at rest, so nothing visibly changes when a scroll starts or stops.
+unsafe class Scene {
+    const int NoStrip = -1;
+    class Item {
+        public string Name;
+        public Rectangle Row;
+        public int[] Strip; // The row's strip color by pixel, or NoStrip outside its rounded corners. Null if it has no highlight.
+        public Rectangle Letters;
+        public int[] Ink; // The name's color by column. Null if it has no font color.
+        public Tint Font;
+    }
+    static readonly Dictionary<string, int[]> stripCache = new Dictionary<string, int[]>(); // Most strips are the same shape and few colors.
+    readonly IEnumerable<Row> rows;
+    readonly Point shift;
+    readonly IDictionary<string, Tint> colors, fontColors;
+    readonly IDictionary<string, NamePlace> places;
+    readonly IDictionary<string, NameShape> shapes;
+    readonly List<Item> items = new List<Item>();
+    public readonly Rectangle Part; // The piece of the screen the picture covers.
+    public readonly Point WindowAt;
+    public readonly IntPtr StripsWindow, NamesWindow;
+    public readonly NameLayer Names;
+    public Snapshot From; // The read these positions came from, when automation offered them after a click.
+
+    public Scene(IEnumerable<Row> rows, Point shift, Rectangle part, Point windowAt, IntPtr stripsWindow, NameLayer names, IntPtr namesWindow, IDictionary<string, Tint> colors, IDictionary<string, Tint> fontColors, IDictionary<string, NamePlace> places, IDictionary<string, NameShape> shapes) {
+        this.rows = rows;
+        this.shift = shift;
+        this.colors = colors;
+        this.fontColors = fontColors;
+        this.places = places;
+        this.shapes = shapes;
+        Part = part;
+        WindowAt = windowAt;
+        StripsWindow = stripsWindow;
+        Names = names;
+        NamesWindow = namesWindow;
+    }
+
+    public void Prepare() {
+        foreach (Row row in rows) {
+            Tint strip, font;
+            NamePlace place = new NamePlace();
+            bool hasStrip = colors.TryGetValue(row.Name, out strip);
+            bool hasName = fontColors.TryGetValue(row.Name, out font) && places.TryGetValue(row.Name, out place) && place.RowSize == row.Bounds.Size;
+            if (!hasStrip && !hasName) continue;
+            Rectangle at = row.Bounds;
+            at.Offset(shift);
+            var item = new Item { Name = row.Name, Row = at };
+            if (hasStrip) item.Strip = StripPixels(strip, at.Size);
+            if (hasName) {
+                item.Font = font;
+                item.Letters = place.On(at);
+                item.Ink = new int[item.Letters.Width];
+                for (int x = 0; x < item.Ink.Length; x++) item.Ink[x] = MenuWindow.Mix(font.From, font.To, x / (double)Math.Max(1, item.Ink.Length - 1)).ToArgb();
+            }
+            items.Add(item);
+        }
+    }
+
+    // Drawn just as the strips' window draws them, so their edges land on the same pixels.
+    static int[] StripPixels(Tint tint, Size size) {
+        string key = tint.From.ToArgb() + "-" + tint.To.ToArgb() + "-" + size;
+        int[] pixels;
+        if (stripCache.TryGetValue(key, out pixels)) return pixels;
+        pixels = new int[size.Width * size.Height];
+        using (var bitmap = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppRgb))
+        using (Graphics g = Graphics.FromImage(bitmap)) {
+            g.Clear(ClickThroughWindow.Clear);
+            Overlay.DrawStrip(g, new Rectangle(Point.Empty, size), tint);
+            BitmapData data = bitmap.LockBits(new Rectangle(Point.Empty, size), ImageLockMode.ReadOnly, bitmap.PixelFormat);
+            Marshal.Copy(data.Scan0, pixels, 0, pixels.Length);
+            bitmap.UnlockBits(data);
+        }
+        int clear = ClickThroughWindow.Clear.ToArgb() & 0xFFFFFF;
+        for (int i = 0; i < pixels.Length; i++) pixels[i] = (pixels[i] & 0xFFFFFF) == clear ? NoStrip : pixels[i] & 0xFFFFFF;
+        stripCache[key] = pixels;
+        return pixels;
+    }
+
+    // Where a row's lines are among a frame's line hashes. The row the mouse is on doesn't count, as it changes without moving.
+    bool Comparable(Item item, int lineCount, int offset, Point cursor, out int firstLine) {
+        Rectangle row = InFrame(item.Row, offset);
+        firstLine = row.Top - ScrollTracker.EdgeInset;
+        return firstLine >= 0 && firstLine + row.Height <= lineCount && !row.Contains(cursor.X - Part.X, cursor.Y - Part.Y);
+    }
+
+    // Keeps how each colored row in view looks, by name. Lines without text can't tell one place from another, so they stay 0 and aren't compared.
+    public void Remember(IDictionary<string, int[]> looks, int[] lines, bool[] hasText, int offset, Point cursor) {
+        foreach (Item item in items) {
+            int first;
+            if (!Comparable(item, lines.Length, offset, cursor, out first)) continue;
+            var look = new int[item.Row.Height];
+            for (int i = 0; i < look.Length; i++) if (hasText[first + i]) look[i] = lines[first + i];
+            looks[item.Name] = look;
+        }
+    }
+
+    // Is each colored row in view where these positions say, going by how it looked before? Rows not seen before can't be checked.
+    public bool Fits(IDictionary<string, int[]> looks, int[] lines, int offset, Point cursor) {
+        foreach (Item item in items) {
+            int first;
+            int[] look;
+            if (!looks.TryGetValue(item.Name, out look) || look.Length != item.Row.Height || !Comparable(item, lines.Length, offset, cursor, out first)) continue;
+            int seen = 0, same = 0;
+            for (int i = 0; i < look.Length; i++) {
+                if (look[i] == 0) continue;
+                seen++;
+                if (lines[first + i] == look[i]) same++;
+            }
+            if (same * 10 < seen * 9) return false;
+        }
+        return true;
+    }
+
+    public bool MoreBelow(int offset, int lineCount) {
+        return items.Any(item => InFrame(item.Row, offset).Bottom - ScrollTracker.EdgeInset > lineCount);
+    }
+
+    Rectangle InFrame(Rectangle box, int offset) {
+        box.Offset(-Part.X, offset - Part.Y);
+        return box;
+    }
+
+    // The blend Windows gives the strips' see-through window, each part rounded on its own. Measured against the real screen: right on all 136,728 color values tried.
+    public static int WithStrip(int app, int strip) {
+        return Channel(app >> 16, strip >> 16) << 16 | Channel(app >> 8, strip >> 8) << 8 | Channel(app, strip);
+    }
+
+    static int Channel(int app, int strip) {
+        return ((strip & 255) * Overlay.Alpha + 127) / 255 + ((app & 255) * (255 - Overlay.Alpha) + 127) / 255;
+    }
+
+    // ponytail: a pixel that lands exactly on the see-through color shows the app beneath it, which is all but the same color.
+    public void Bake(int* raw, int* into, int offset) {
+        int width = Part.Width, height = Part.Height;
+        Buffer.MemoryCopy(raw, into, width * height * 4, width * height * 4);
+        foreach (Item item in items) {
+            Rectangle row = InFrame(item.Row, offset);
+            if (row.Bottom <= 0 || row.Top >= height) continue;
+            if (item.Strip != null) {
+                int right = Math.Min(width, row.Right);
+                for (int y = Math.Max(0, row.Top); y < Math.Min(height, row.Bottom); y++) {
+                    int* line = into + y * width;
+                    int stripLine = (y - row.Top) * row.Width - row.Left;
+                    for (int x = Math.Max(0, row.Left); x < right; x++) {
+                        int tint = item.Strip[stripLine + x];
+                        if (tint != NoStrip) line[x] = WithStrip(line[x], tint);
+                    }
+                }
+            }
+            if (item.Ink != null) BakeName(item, raw, into, offset);
+        }
+    }
+
+    // Worked out from this frame's own pixels, so a row coming into view, or one the mouse is lighting up, is right straight away. Keep the sums the same as NameShape's.
+    void BakeName(Item item, int* raw, int* into, int offset) {
+        int width = Part.Width, height = Part.Height;
+        Rectangle box = InFrame(item.Letters, offset), seen = Rectangle.Intersect(box, new Rectangle(0, 0, width, height));
+        int beside = NameShape.LineBeside(seen, 0, height);
+        if (seen.IsEmpty || beside < 0) return;
+        int* rawLine = raw + beside * width;
+        int* tintedLine = into + beside * width;
+        double strongest = 0;
+        for (int y = seen.Top; y < seen.Bottom; y++) {
+            int* line = raw + y * width;
+            for (int x = seen.Left; x < seen.Right; x++) {
+                int p = line[x], b = rawLine[x];
+                double lift = (((p >> 16) & 255) - ((b >> 16) & 255) + ((p >> 8) & 255) - ((b >> 8) & 255) + (p & 255) - (b & 255)) / 3.0;
+                if (Math.Abs(lift) > Math.Abs(strongest)) strongest = lift;
+            }
+        }
+        if (Math.Abs(strongest) < NameShape.MinContrast) return;
+        for (int y = seen.Top; y < seen.Bottom; y++) {
+            int* from = raw + y * width;
+            int* to = into + y * width;
+            for (int x = seen.Left; x < seen.Right; x++) {
+                int p = from[x], b = rawLine[x];
+                double red = ColorPicker.Clamp((((p >> 16) & 255) - ((b >> 16) & 255)) / strongest);
+                double green = ColorPicker.Clamp((((p >> 8) & 255) - ((b >> 8) & 255)) / strongest);
+                double blue = ColorPicker.Clamp(((p & 255) - (b & 255)) / strongest);
+                if (Math.Max(red, Math.Max(green, blue)) < NameShape.Untouched) continue;
+                int ink = item.Ink[x - box.Left], under = tintedLine[x];
+                to[x] = Blend((under >> 16) & 255, (ink >> 16) & 255, red) << 16 | Blend((under >> 8) & 255, (ink >> 8) & 255, green) << 8 | Blend(under & 255, ink & 255, blue);
+            }
+        }
+    }
+
+    static int Blend(int from, int to, double amount) { return (int)Math.Round(from + (to - from) * amount); }
+
+    // When the scroll ends the names go back to their own window, so each one in view gets its letters and background from this last frame. Otherwise it would flash the app's color until the next read.
+    public void Settle(int* raw, int* baked, int offset) {
+        foreach (Item item in items) {
+            if (item.Ink == null) continue;
+            Rectangle row = InFrame(item.Row, offset), seen = Rectangle.Intersect(InFrame(item.Letters, offset), new Rectangle(Point.Empty, Part.Size));
+            int beside = NameShape.LineBeside(seen, 0, Part.Height);
+            if (seen.IsEmpty || beside < 0) continue;
+            NameShape shape;
+            bool known = shapes.TryGetValue(item.Name, out shape) && shape.RowSize == item.Row.Size && shape.On(row).Contains(seen);
+            Rectangle columns = known ? shape.On(row) : seen;
+            Color[] tinted = ReadLine(baked, beside, columns);
+            if (!known) {
+                var pixels = new Color[seen.Width, seen.Height];
+                for (int x = 0; x < seen.Width; x++)
+                    for (int y = 0; y < seen.Height; y++) pixels[x, y] = Color.FromArgb(raw[(seen.Y + y) * Part.Width + seen.X + x] | unchecked((int)0xFF000000));
+                shape = NameShape.Measure(pixels, ReadLine(raw, beside, seen));
+                if (shape == null) continue;
+                shape.Offset = new Point(seen.X - row.X, seen.Y - row.Y);
+                shape.RowSize = item.Row.Size;
+            } else if (tinted.SequenceEqual(shape.Above)) continue;
+            shape.Above = tinted;
+            shape.Render(item.Font);
+            shapes[item.Name] = shape;
+        }
+    }
+
+    Color[] ReadLine(int* pixels, int y, Rectangle columns) {
+        var line = new Color[columns.Width];
+        for (int x = 0; x < columns.Width; x++) line[x] = Color.FromArgb(pixels[y * Part.Width + columns.X + x] | unchecked((int)0xFF000000));
+        return line;
+    }
+}
 static class Sidebar {
     // ponytail: leans on the app's English button label and a class name, so an app update can break it. --check shows when it has.
     const string Prefix = "New session in ";
@@ -247,11 +752,44 @@ static class Sidebar {
             string name = button.Cached.Name;
             if (!name.StartsWith(Prefix, StringComparison.Ordinal)) continue;
             // The button's parent is the full heading row. Rows scrolled out of view are kept: none on screen doesn't mean none exist.
-            Rectangle row = ToRectangle(TreeWalker.RawViewWalker.GetParent(button).Current.BoundingRectangle);
+            AutomationElement parent = TreeWalker.RawViewWalker.GetParent(button);
+            Rectangle row = ToRectangle(parent.Current.BoundingRectangle);
             if (row.Width > 0 && row.Height > 0)
-                snapshot.Rows.Add(new Row { Name = name.Substring(Prefix.Length), Bounds = row });
+                snapshot.Rows.Add(new Row { Name = name.Substring(Prefix.Length), Bounds = row, Element = parent });
         }
         return snapshot;
+    }
+
+    // New positions for rows already found, which costs next to nothing and keeps nothing. Throws if one has gone: measured, all of them do as soon as the app's menu hides its page.
+    public static Snapshot Reread(IntPtr window, AutomationElement list, Snapshot found) {
+        var snapshot = new Snapshot { Window = window, Area = ToRectangle(list.Current.BoundingRectangle) };
+        foreach (Row known in found.Rows) {
+            Rectangle row = ToRectangle(known.Element.Current.BoundingRectangle);
+            if (row.Width > 0 && row.Height > 0)
+                snapshot.Rows.Add(new Row { Name = known.Name, Bounds = row, Element = known.Element });
+        }
+        return snapshot;
+    }
+
+    // The rectangle hugging a heading's letters, kept to the part of the row that text can use. Only a raw walk finds it: the normal search skips text nested in a button.
+    // ponytail: leans on an empty class name and a class prefix, so an app update can break it. Names then just keep the app's color.
+    public static Rectangle FindName(Row row) {
+        Rectangle name = Rectangle.Empty, room = Rectangle.Empty;
+        var todo = new Stack<AutomationElement>();
+        todo.Push(row.Element);
+        while (todo.Count > 0) {
+            AutomationElement element = todo.Pop();
+            if (element.Current.ControlType == ControlType.Text) {
+                string kind = element.Current.ClassName;
+                if (kind == "" && element.Current.Name == row.Name) name = ToRectangle(element.Current.BoundingRectangle);
+                else if (kind.StartsWith("flex min-w-0", StringComparison.Ordinal)) room = ToRectangle(element.Current.BoundingRectangle);
+            }
+            for (AutomationElement child = TreeWalker.RawViewWalker.GetFirstChild(element); child != null; child = TreeWalker.RawViewWalker.GetNextSibling(child)) todo.Push(child);
+        }
+        if (name.IsEmpty) return name;
+        name.Inflate(1, 0); // Letters can hang a pixel outside their box.
+        if (!room.IsEmpty) name.Intersect(room);
+        return name;
     }
 
     // Where the app's own open menu is, or empty if none is open.
@@ -280,8 +818,10 @@ struct Tint {
 }
 
 static class ColorFile {
-    static readonly string FilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClaudeColorCoded", "colors.txt");
+    public const string Highlights = "colors.txt", FontColors = "font-colors.txt";
     static readonly Regex Line = new Regex("^(.+)=#([0-9a-fA-F]{6})(?:-#([0-9a-fA-F]{6}))?$");
+
+    static string PathOf(string file) { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClaudeColorCoded", file); }
 
     static Color FromHex(string hex) { return Color.FromArgb(Convert.ToInt32("FF" + hex, 16)); }
     static string ToHex(Color color) { return string.Format("#{0:x2}{1:x2}{2:x2}", color.R, color.G, color.B); }
@@ -297,40 +837,110 @@ static class ColorFile {
         return colors;
     }
 
-    public static IEnumerable<string> Format(Dictionary<string, Tint> colors) {
+    public static IEnumerable<string> Format(IDictionary<string, Tint> colors) {
         return colors.Select(c => c.Key + "=" + ToHex(c.Value.From) + (c.Value.IsGradient ? "-" + ToHex(c.Value.To) : ""));
     }
 
-    public static Dictionary<string, Tint> Load() {
-        return Parse(File.Exists(FilePath) ? File.ReadAllLines(FilePath, Encoding.UTF8) : new string[0]);
+    public static Dictionary<string, Tint> Load(string file) {
+        string path = PathOf(file);
+        return Parse(File.Exists(path) ? File.ReadAllLines(path, Encoding.UTF8) : new string[0]);
     }
 
-    public static void Save(Dictionary<string, Tint> colors) {
-        Directory.CreateDirectory(Path.GetDirectoryName(FilePath));
-        File.WriteAllLines(FilePath, Format(colors), Encoding.UTF8);
+    public static void Save(string file, IDictionary<string, Tint> colors) {
+        string path = PathOf(file);
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        File.WriteAllLines(path, Format(colors), Encoding.UTF8);
     }
 }
 
-// The tinted strips. Click-through, and owned by the Claude window so it stays with it in the window stack.
-// It covers the sidebar's screen and stays put, and the strips are redrawn to follow the app's window. Measured with real drags, with no helper running: moving any other window
-// during a drag left the app's window 260 ms behind the cursor, whatever the flags, against 5 ms with nothing else happening. A full-screen window redrawing also left it at 5 ms.
-class Overlay : Form {
-    public const double Strength = 0.3;
-    readonly Dictionary<string, Tint> colors;
-    public List<Row> Rows = new List<Row>();
-    public Rectangle Column; // The sidebar, where the rows' positions were measured.
-    public Point Shift; // How far the app's window has moved since then.
-    public int ScrollOffset;
-    public Rectangle Hole; // The app's own menu while it's open. This window sits above the whole app, so strips must not be drawn across it.
+// The letters of a group's name, read off the screen. The app's text can't be changed, so the name is repainted over itself in the chosen color.
+// Measuring the real pixels keeps the app's own font and its colored subpixel edges, which drawing the text again with a system font wouldn't.
+class NameShape {
+    public const int MinContrast = 20, BesideGap = 2; // How far from the letters the background is read, clear of anything hanging off them.
+    public const double Untouched = 0.02;
+    readonly double[,,] coverage; // How much of each pixel's red, green and blue the letters cover, 0 to 1.
+    public Point Offset; // From the row's corner.
+    public Size RowSize; // Another size means a resized sidebar or a zoom, so the name gets read again.
+    public Color[] Above; // The background beside the letters, by column. Strips and hovering change it, so it's read again and again.
+    public Bitmap Image;
 
-    public Overlay(Dictionary<string, Tint> colors) {
-        this.colors = colors;
+    NameShape(double[,,] coverage) { this.coverage = coverage; }
+
+    public static Color[,] Read(Rectangle box) {
+        var pixels = new Color[box.Width, box.Height];
+        using (var bitmap = new Bitmap(box.Width, box.Height, PixelFormat.Format32bppRgb))
+        using (Graphics g = Graphics.FromImage(bitmap)) {
+            g.CopyFromScreen(box.Location, Point.Empty, box.Size);
+            for (int x = 0; x < box.Width; x++)
+                for (int y = 0; y < box.Height; y++) pixels[x, y] = bitmap.GetPixel(x, y);
+        }
+        return pixels;
+    }
+
+    public static Color[] ReadLine(int y, Rectangle columns) {
+        Color[,] line = Read(new Rectangle(columns.X, y, columns.Width, 1));
+        return Enumerable.Range(0, columns.Width).Select(x => line[x, 0]).ToArray();
+    }
+
+    // The line to read the background from: just over the letters, or just under them when the list's edge has cut off the line above. Negative if neither is in view.
+    public static int LineBeside(Rectangle letters, int top, int bottom) {
+        int above = letters.Top - BesideGap, below = letters.Bottom + BesideGap - 1;
+        return above >= top ? above : below < bottom ? below : -1;
+    }
+
+    // Null if these pixels hold no text. The background is judged column by column because a gradient strip's changes across the name.
+    public static NameShape Measure(Color[,] pixels, Color[] above) {
+        int width = pixels.GetLength(0), height = pixels.GetLength(1);
+        double strongest = 0;
+        for (int x = 0; x < width; x++)
+            for (int y = 0; y < height; y++) {
+                double lift = (pixels[x, y].R - above[x].R + pixels[x, y].G - above[x].G + pixels[x, y].B - above[x].B) / 3.0;
+                if (Math.Abs(lift) > Math.Abs(strongest)) strongest = lift;
+            }
+        if (Math.Abs(strongest) < MinContrast) return null;
+        var coverage = new double[width, height, 3];
+        for (int x = 0; x < width; x++)
+            for (int y = 0; y < height; y++) {
+                coverage[x, y, 0] = ColorPicker.Clamp((pixels[x, y].R - above[x].R) / strongest);
+                coverage[x, y, 1] = ColorPicker.Clamp((pixels[x, y].G - above[x].G) / strongest);
+                coverage[x, y, 2] = ColorPicker.Clamp((pixels[x, y].B - above[x].B) / strongest);
+            }
+        return new NameShape(coverage) { Above = above };
+    }
+
+    public Rectangle On(Rectangle row) {
+        return new Rectangle(row.X + Offset.X, row.Y + Offset.Y, coverage.GetLength(0), coverage.GetLength(1));
+    }
+
+    // Each pixel is solid, worked out against the background, rather than see-through: anything see-through would let the app's own letters show round the edges.
+    // A gradient runs across the name, not the whole row.
+    public Color ColorAt(int x, int y, Tint tint) {
+        double red = coverage[x, y, 0], green = coverage[x, y, 1], blue = coverage[x, y, 2];
+        if (Math.Max(red, Math.Max(green, blue)) < Untouched) return ClickThroughWindow.Clear;
+        Color ink = MenuWindow.Mix(tint.From, tint.To, x / (double)Math.Max(1, coverage.GetLength(0) - 1)), under = Above[x];
+        Color result = Color.FromArgb(MenuWindow.Mix(under, ink, red).R, MenuWindow.Mix(under, ink, green).G, MenuWindow.Mix(under, ink, blue).B);
+        return result.ToArgb() == ClickThroughWindow.Clear.ToArgb() ? Color.FromArgb(result.R, result.G, result.B + 1) : result; // Or the pixel would vanish.
+    }
+
+    public void Render(Tint tint) {
+        var fresh = new Bitmap(coverage.GetLength(0), coverage.GetLength(1), PixelFormat.Format32bppRgb);
+        for (int x = 0; x < fresh.Width; x++)
+            for (int y = 0; y < fresh.Height; y++) fresh.SetPixel(x, y, ColorAt(x, y, tint));
+        if (Image != null) Image.Dispose();
+        Image = fresh;
+    }
+}
+
+// A window that draws over the app without ever taking a click or the focus.
+abstract class ClickThroughWindow : Form {
+    public static readonly Color Clear = Color.FromArgb(1, 2, 3); // Pixels of this exact color turn see-through, so it can't be one anybody would pick.
+
+    protected ClickThroughWindow() {
         AutoScaleMode = AutoScaleMode.None;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
-        BackColor = TransparencyKey = Color.FromArgb(1, 2, 3); // Pixels of this exact color turn see-through, so it can't be one anybody would pick.
-        Opacity = Strength;
+        BackColor = TransparencyKey = Clear;
         DoubleBuffered = true;
     }
 
@@ -343,6 +953,37 @@ class Overlay : Form {
             return cp;
         }
     }
+}
+
+// The tinted strips. Click-through, and owned by the Claude window so it stays with it in the window stack.
+// It covers the sidebar's screen and stays put, and the strips are redrawn to follow the app's window. Measured with real drags, with no helper running: moving any other window
+// during a drag left the app's window 260 ms behind the cursor, whatever the flags, against 5 ms with nothing else happening. A full-screen window redrawing also left it at 5 ms.
+class Overlay : ClickThroughWindow {
+    public const double Strength = 0.3;
+    public const int Alpha = (int)(Strength * 255); // What Windows Forms hands Windows for that opacity.
+    readonly Dictionary<string, Tint> colors;
+    public readonly NameLayer Names;
+    public List<Row> Rows = new List<Row>();
+    public Rectangle Column; // The sidebar, where the rows' positions were measured.
+    public Point Shift; // How far the app's window has moved since then.
+    public int ScrollOffset;
+    public Rectangle Hole; // The app's own menu while it's open. This window sits above the whole app, so strips must not be drawn across it.
+
+    public Overlay(Dictionary<string, Tint> colors, IDictionary<string, Tint> fontColors, IDictionary<string, NameShape> shapes) {
+        this.colors = colors;
+        Opacity = Strength;
+        Names = new NameLayer(this, fontColors, shapes);
+    }
+
+    protected override void Dispose(bool disposing) {
+        if (disposing) Names.Dispose();
+        base.Dispose(disposing);
+    }
+
+    protected override void OnVisibleChanged(EventArgs e) {
+        base.OnVisibleChanged(e);
+        Names.Sync();
+    }
 
     Rectangle ColumnNow {
         get {
@@ -352,15 +993,36 @@ class Overlay : Form {
         }
     }
 
-    // Only ever the sidebar's part of this window, which would be slow to redraw whole.
-    public void RedrawColumn() { Invalidate(ColumnNow); }
+    // How far a row's position is from where it lands in these windows.
+    public Point RowShift { get { return new Point(Shift.X - Left, Shift.Y - Top + ScrollOffset); } }
+
+    public void ClipToColumn(Graphics g) {
+        g.IntersectClip(ColumnNow);
+        if (!Hole.IsEmpty) g.ExcludeClip(new Rectangle(Hole.X - Left, Hole.Y - Top, Hole.Width, Hole.Height));
+    }
+
+    // Only ever the sidebar's part of these windows, which would be slow to redraw whole.
+    public void RedrawColumn() {
+        Invalidate(ColumnNow);
+        Names.RedrawNames();
+    }
+
+    // For when more than the names' own spots needs wiping: the picture a scroll leaves, or a name that's lost its color.
+    public void WipeNames() { Names.Invalidate(ColumnNow); }
+
+    public Rectangle PartOnScreen { get { return Rectangle.Intersect(new Rectangle(Column.X + Shift.X, Column.Y + Shift.Y, Column.Width, Column.Height), Bounds); } }
+
+    public void PaintNow() {
+        Update();
+        Names.Update();
+    }
 
     public void MoveColumn(Point shift) {
         RedrawColumn();
         Shift = shift;
         FitToScreen();
         RedrawColumn();
-        Update();
+        PaintNow();
     }
 
     // The screen the sidebar is on, leaving out its taskbar, and a pixel short for a hidden taskbar. Measured: a window covering a whole screen counts as a fullscreen app, and the taskbar
@@ -371,22 +1033,26 @@ class Overlay : Form {
         column.Offset(Shift);
         Rectangle area = Screen.FromRectangle(column).WorkingArea;
         Bounds = new Rectangle(area.X, area.Y, area.Width, area.Height - 1);
+        Names.Bounds = Bounds;
     }
 
     protected override void OnPaint(PaintEventArgs e) {
         // Smoothing stays off: blended edge pixels wouldn't match the transparency color and would show as fringes.
         e.Graphics.SmoothingMode = SmoothingMode.None;
-        e.Graphics.IntersectClip(ColumnNow);
-        if (!Hole.IsEmpty) e.Graphics.ExcludeClip(new Rectangle(Hole.X - Left, Hole.Y - Top, Hole.Width, Hole.Height));
+        ClipToColumn(e.Graphics);
         foreach (Row row in Rows) {
             Tint tint;
             if (!colors.TryGetValue(row.Name, out tint)) continue;
             Rectangle box = row.Bounds;
-            box.Offset(Shift.X - Left, Shift.Y - Top + ScrollOffset);
-            using (GraphicsPath path = Rounded(box, 16))
-            using (Brush brush = tint.BrushFor(box))
-                e.Graphics.FillPath(brush, path);
+            box.Offset(RowShift);
+            DrawStrip(e.Graphics, box, tint);
         }
+    }
+
+    public static void DrawStrip(Graphics g, Rectangle box, Tint tint) {
+        using (GraphicsPath path = Rounded(box, 16))
+        using (Brush brush = tint.BrushFor(box))
+            g.FillPath(brush, path);
     }
 
     public static GraphicsPath Rounded(Rectangle box, int diameter) {
@@ -398,6 +1064,54 @@ class Overlay : Form {
         path.AddArc(box.X, box.Bottom - d, d, d, 90, 90);
         path.CloseFigure();
         return path;
+    }
+}
+
+// The recolored names, in their own window above the strips' see-through one so they keep their full strength. It's solid where it draws, so during a scroll it also shows the whole baked picture of the sidebar.
+class NameLayer : ClickThroughWindow {
+    readonly Overlay strips;
+    readonly IDictionary<string, Tint> fontColors;
+    readonly IDictionary<string, NameShape> shapes;
+    public volatile bool Mirroring; // The scroll tracker is drawing here directly, so painting must leave it alone.
+
+    public NameLayer(Overlay strips, IDictionary<string, Tint> fontColors, IDictionary<string, NameShape> shapes) {
+        this.strips = strips;
+        this.fontColors = fontColors;
+        this.shapes = shapes;
+    }
+
+    public void Sync() { Visible = strips.Visible; }
+
+    protected override void WndProc(ref Message m) {
+        const int WM_PAINT = 0xF;
+        if (m.Msg == WM_PAINT && Mirroring) { Native.ValidateRect(Handle, IntPtr.Zero); return; }
+        base.WndProc(ref m);
+    }
+
+    // Just the names' own spots, as they're all that's ever on this window at rest. Redrawing the rest during a drag would slow the app's window down for nothing.
+    public void RedrawNames() {
+        Point shift = strips.RowShift;
+        foreach (Row row in strips.Rows) {
+            NameShape shape;
+            if (!fontColors.ContainsKey(row.Name) || !shapes.TryGetValue(row.Name, out shape) || shape.Image == null || shape.RowSize != row.Bounds.Size) continue;
+            Rectangle box = shape.On(row.Bounds);
+            box.Offset(shift);
+            Invalidate(box);
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        strips.ClipToColumn(e.Graphics);
+        // Copied exactly: a blended pixel would match neither its background nor the see-through color.
+        e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+        e.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
+        Point shift = strips.RowShift;
+        foreach (Row row in strips.Rows) {
+            NameShape shape;
+            if (!fontColors.ContainsKey(row.Name) || !shapes.TryGetValue(row.Name, out shape) || shape.Image == null || shape.RowSize != row.Bounds.Size) continue;
+            var at = new Point(row.Bounds.X + shape.Offset.X + shift.X, row.Bounds.Y + shape.Offset.Y + shift.Y);
+            e.Graphics.DrawImage(shape.Image, new Rectangle(at, shape.Image.Size));
+        }
     }
 }
 
@@ -508,62 +1222,75 @@ abstract class MenuWindow : Form {
     }
 }
 
-// The Select color row. The app's menu can't be changed from outside, so this is a separate window that takes the place of the menu's top edge.
+// The Select font color and Select color rows. The app's menu can't be changed from outside, so this is a separate window that takes the place of the menu's top edge.
 // It sits above the menu's first item rather than at the bottom next to the red Delete item, so a slip can't land on that.
 // ponytail: opens on click rather than hover, the app's arrow keys can't reach it, and sizes assume 100% display scaling. Scale them if a scaled screen gets used.
 class ColorPanel : MenuWindow {
-    const int FirstAppItem = Gutter + ItemHeight + SeparatorGap, Above = FirstAppItem - Gutter;
-    bool hover, expanded;
-    public Action Clicked;
+    public const int FontRow = 0, HighlightRow = 1;
+    static readonly string[] Labels = { "Select font color", "Select color" };
+    const int FirstAppItem = Gutter + ItemHeight * 2 + SeparatorGap, Above = FirstAppItem - Gutter;
+    int hover = -1, expanded = -1;
+    public Action<int> Clicked;
 
     // Runs down past the menu's top to cover its rounded corners and continue its straight edges.
+    // ponytail: for a heading right at the top of the screen the rows stay on screen by covering part of the app's first item. Scrolling down a little frees it.
     public static Rectangle BoundsFor(Rectangle menu) {
-        return new Rectangle(menu.X, menu.Y - Above, menu.Width, Above + Corner);
+        return new Rectangle(menu.X, Math.Max(menu.Y - Above, Screen.FromRectangle(menu).WorkingArea.Top), menu.Width, Above + Corner);
     }
 
     // Where this window is solid and takes clicks, on screen. Below it, the app's own items show through a hole.
     public Rectangle RowArea { get { return new Rectangle(Left, Top, Width, FirstAppItem); } }
 
-    Rectangle Item { get { return new Rectangle(Gutter, Gutter, Width - Gutter * 2 + 1, ItemHeight); } }
+    Rectangle Item(int row) { return new Rectangle(Gutter, Gutter + ItemHeight * row, Width - Gutter * 2 + 1, ItemHeight); }
+
+    int RowAt(Point point) {
+        for (int row = 0; row < Labels.Length; row++) if (Item(row).Contains(point)) return row;
+        return -1;
+    }
+
+    public int TopOf(int row) { return Top + ItemHeight * row; }
 
     public void Place(Rectangle menu) {
         Bounds = BoundsFor(menu);
-        hover = expanded = false;
+        hover = expanded = -1;
         Render();
         Show();
     }
 
-    public bool Expanded {
+    public int Expanded {
         set { expanded = value; if (Visible) Render(); }
     }
 
     protected override void OnMouseMove(MouseEventArgs e) {
-        bool over = Item.Contains(e.Location);
+        int over = RowAt(e.Location);
         if (over != hover) { hover = over; Render(); }
     }
 
     protected override void OnMouseLeave(EventArgs e) {
-        hover = false;
+        hover = -1;
         Render();
     }
 
     protected override void OnMouseUp(MouseEventArgs e) {
-        if (e.Button == MouseButtons.Left && Item.Contains(e.Location)) Clicked();
+        int row = RowAt(e.Location);
+        if (e.Button == MouseButtons.Left && row >= 0) Clicked(row);
     }
 
     protected override void Draw(Graphics g) {
         DrawFrame(g, Height + Corner * 2); // Runs off the bottom of the window, so only the rounded top shows.
-        Rectangle item = Item;
-        if (hover || expanded) DrawHighlight(g, item);
-        DrawLabel(g, "Select color", item.X + ItemPad, item.Y);
-        int mid = item.Y + item.Height / 2, x = item.Right - 15;
-        using (var pen = new Pen(Ink, 1.5f)) g.DrawLines(pen, new[] { new PointF(x, mid - 4), new PointF(x + 4, mid), new PointF(x, mid + 4) });
-        DrawSeparator(g, item.Bottom + 4);
+        for (int row = 0; row < Labels.Length; row++) {
+            Rectangle item = Item(row);
+            if (row == hover || row == expanded) DrawHighlight(g, item);
+            DrawLabel(g, Labels[row], item.X + ItemPad, item.Y);
+            int mid = item.Y + item.Height / 2, x = item.Right - 15;
+            using (var pen = new Pen(Ink, 1.5f)) g.DrawLines(pen, new[] { new PointF(x, mid - 4), new PointF(x + 4, mid), new PointF(x, mid + 4) });
+        }
+        DrawSeparator(g, Item(Labels.Length - 1).Bottom + 4);
 
         // The hole over the app's first item, so it shows through and stays clickable. Fully clear pixels let the mouse through.
         g.CompositingMode = CompositingMode.SourceCopy;
         g.SmoothingMode = SmoothingMode.None;
-        using (var clear = new SolidBrush(Color.Transparent)) g.FillRectangle(clear, item.X, FirstAppItem, item.Width, Height - FirstAppItem);
+        using (var clear = new SolidBrush(Color.Transparent)) g.FillRectangle(clear, Gutter, FirstAppItem, Item(0).Width, Height - FirstAppItem);
     }
 }
 
@@ -663,6 +1390,7 @@ class ColorPicker : MenuWindow {
     readonly double[] hue = new double[2], saturation = new double[2], brightness = new double[2];
     bool gradient, overApply;
     int slot, dragging; // Which of the two colors is being edited, and what's being dragged: 0 nothing, 1 the square, 2 the hue bar.
+    double strength; // How solid the result will look: a highlight is see-through, a name isn't.
     Action<Tint> pick;
 
     public ColorPicker() { Width = Pad * 2 + Inner; }
@@ -696,8 +1424,9 @@ class ColorPicker : MenuWindow {
         return brush;
     }
 
-    public void Open(Tint? current, bool gradient, Point at, Action<Tint> pick) {
+    public void Open(Tint? current, bool gradient, Point at, double strength, Action<Tint> pick) {
         this.gradient = gradient;
+        this.strength = strength;
         this.pick = pick;
         slot = dragging = 0;
         overApply = false;
@@ -710,7 +1439,7 @@ class ColorPicker : MenuWindow {
         Show();
     }
 
-    static double Clamp(double value) { return Math.Max(0, Math.Min(1, value)); }
+    public static double Clamp(double value) { return Math.Max(0, Math.Min(1, value)); }
 
     void Track(Point point) {
         Rectangle box = dragging == 1 ? SquareBox : HueBox;
@@ -762,8 +1491,8 @@ class ColorPicker : MenuWindow {
             DrawLabel(g, i == 0 ? "Left" : "Right", chip.X + 28, chip.Y);
         }
 
-        // The preview is as see-through as the strips, so it shows roughly how the highlight will look.
-        int alpha = (int)(255 * Overlay.Strength);
+        // The preview is as see-through as the result, so it shows roughly how it will look.
+        int alpha = (int)(255 * strength);
         Tint result = Result;
         using (GraphicsPath path = Overlay.Rounded(PreviewBox, 16))
         using (Brush brush = new Tint(Color.FromArgb(alpha, result.From), Color.FromArgb(alpha, result.To)).BrushFor(PreviewBox))
@@ -790,12 +1519,16 @@ class ColorPicker : MenuWindow {
 }
 
 class App : ApplicationContext {
-    const int WH_MOUSE_LL = 14, WM_LBUTTONDOWN = 0x201, WM_RBUTTONDOWN = 0x204, WM_MBUTTONDOWN = 0x207, WM_MOUSEWHEEL = 0x20A;
+    const int WH_MOUSE_LL = 14, WM_LBUTTONDOWN = 0x201, WM_LBUTTONUP = 0x202, WM_RBUTTONDOWN = 0x204, WM_MBUTTONDOWN = 0x207, WM_MOUSEWHEEL = 0x20A;
     const int GWLP_HWNDPARENT = -8;
     const uint GA_ROOT = 2;
     const int SettleMs = 250; // Automation's positions lag by up to 160 ms, so they can't be trusted until this long after the window stops.
+    const int MaxLateReads = 15; // About 1.2 s with the app in front.
 
-    readonly Dictionary<string, Tint> colors = ColorFile.Load();
+    readonly Dictionary<string, Tint> colors = ColorFile.Load(ColorFile.Highlights);
+    readonly ConcurrentDictionary<string, Tint> fontColors = new ConcurrentDictionary<string, Tint>(ColorFile.Load(ColorFile.FontColors)); // Also read off the UI thread, as are the shapes.
+    readonly ConcurrentDictionary<string, NameShape> shapes = new ConcurrentDictionary<string, NameShape>();
+    readonly ConcurrentDictionary<string, NamePlace> places = new ConcurrentDictionary<string, NamePlace>();
     readonly ColorMenu menu = new ColorMenu();
     readonly ColorPanel panel = new ColorPanel();
     readonly ColorPicker picker = new ColorPicker();
@@ -809,17 +1542,18 @@ class App : ApplicationContext {
     volatile bool stripsQueued;
     readonly ScrollTracker tracker;
     volatile Snapshot latest = new Snapshot();
-    Snapshot shown;
+    Snapshot shown, offered;
     Overlay overlay;
     IntPtr owner = IntPtr.Zero;
     Row menuRow; // The heading that was right-clicked, and the window that took the click.
     IntPtr menuTarget;
-    Rectangle menuArea; // The app's own menu, while the Select color row is attached to it.
+    Rectangle menuArea; // The app's own menu, while the color rows are attached to it.
+    int listFor = -1; // Which color row the open list or picker belongs to.
     volatile bool closeAppMenu, menuWatching;
 
     public App() {
         GC.KeepAlive(menu.Handle); // The mouse hook and the tracker post to the menu, so its window must exist first.
-        tracker = new ScrollTracker(() => menu.BeginInvoke((Action)ShowOffset));
+        tracker = new ScrollTracker(() => menu.BeginInvoke((Action)EndPicture), snapshot => menu.BeginInvoke((Action)(() => { shown = snapshot; Place(snapshot); })));
 
         var trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("Quit Claude Color Coded", null, (s, e) => ExitThread());
@@ -846,37 +1580,52 @@ class App : ApplicationContext {
         base.ExitThreadCore();
     }
 
+    // Searching the tree takes 30 ms, with the app working through it too, and measured, each search keeps about 16 KB of Windows' memory for good, whatever gets cleaned up. So rows found are held on to and searched for again only now and then.
+    // A heading that newly appears can wait this long for its colors, unless a click moved rows, which searches at once.
+    // ponytail: measured, that still comes to about 12 MB an hour with Claude in front. On a page with no sidebar it searches once a second, which works out at about 60 MB an hour.
+    const int SearchInFrontMs = 5000, SearchBehindMs = 30000;
+
     void PollLoop() {
         IntPtr window = IntPtr.Zero;
         AutomationElement list = null;
+        Snapshot found = null;
         string last = "";
-        int failures = 0;
+        int failures = 0, still = 0, lateReads = 0, searchedAt = Environment.TickCount - SearchBehindMs;
         while (true) {
             // Measured: while the app's menu is open the app hides its page from automation, so a read finds no headings and would wipe the strips. Keep what's drawn.
             // While the window moves, automation's positions arrive late and row by row, and FollowDrag covers that time.
-            if (menuWatching || Moving) { Thread.Sleep(50); continue; }
+            if (menuWatching || Moving) { still = 0; Thread.Sleep(50); continue; }
             int moveBefore = lastMove;
             var snapshot = new Snapshot();
-            bool fast = false;
+            bool fast = false, searched = false;
             bool scrollEnded = tracker.Active && !tracker.Capturing; // Checked before reading, so this read is newer than the scroll.
             try {
-                if (!Native.IsWindow(window)) { window = Sidebar.FindWindow(); list = null; }
+                if (!Native.IsWindow(window)) { window = Sidebar.FindWindow(); list = null; found = null; }
                 snapshot.Window = window;
                 if (window != IntPtr.Zero && !Native.IsIconic(window)) {
-                    if (list == null) list = Sidebar.FindList(window);
+                    bool front = Native.GetForegroundWindow() == window;
+                    bool searchDue = Environment.TickCount - searchedAt > (front ? SearchInFrontMs : SearchBehindMs);
+                    if (list == null && (front || searchDue)) {
+                        list = Sidebar.FindList(window);
+                        searchedAt = Environment.TickCount;
+                    }
                     if (list != null) {
                         Native.RECT at;
                         Native.GetWindowRect(window, out at);
-                        snapshot = Sidebar.Read(window, list);
+                        searched = found == null || searchDue;
+                        snapshot = searched ? Sidebar.Read(window, list) : Sidebar.Reread(window, list, found);
                         snapshot.WindowAt = new Point(at.Left, at.Top);
-                        if (snapshot.Rows.Count == 0) list = null;
+                        if (searched) { found = snapshot; searchedAt = Environment.TickCount; }
+                        else if (snapshot.Rows.Count != found.Rows.Count) found = null; // A row has gone, so look again next time.
+                        if (snapshot.Rows.Count == 0) { list = null; found = null; }
                     }
-                    fast = list != null && Native.GetForegroundWindow() == window;
+                    fast = list != null && front;
                 }
                 failures = 0;
             } catch (Exception) {
                 // Measured: while the app is busy, reads fail every second or two and the next one works.
                 // So keep what's drawn and retry. Only a long run of failures means the page really changed.
+                found = null;
                 if (++failures < 20) { Thread.Sleep(20); continue; }
                 failures = 0;
                 list = null;
@@ -884,10 +1633,80 @@ class App : ApplicationContext {
             }
             if (lastMove != moveBefore) continue; // The window moved during this read, so its positions are a mix.
             string signature = snapshot.Signature();
-            if (signature != last) { last = signature; latest = snapshot; }
-            if (scrollEnded) tracker.Finish();
-            tracker.PollNow.WaitOne(fast || tracker.Active ? 80 : 1000);
+            if (signature != last) {
+                last = signature;
+                latest = snapshot;
+                still = 0;
+                if (tracker.WatchingLayout) {
+                    menu.BeginInvoke((Action)Apply); // Rather than wait for the timer, when the picture may be waiting on this.
+                    if (!searched) { found = null; tracker.PollNow.Set(); } // Rows moved after a click, and there may be new ones among them.
+                }
+            } else still++;
+            // Measured: automation can still report the old positions a good while after a scroll stops, and handing over to those would throw the strips back to where they were.
+            // So wait for it to catch up. If it never does, the layout changed during the scroll, or the tracking was off, and automation is right.
+            if (scrollEnded && (CaughtUp(snapshot) || ++lateReads > MaxLateReads)) { lateReads = 0; tracker.Finish(); }
+            // Automation's positions arrive late, so names are only read once they've held for a couple of reads.
+            if (still >= 2 && fast && !tracker.Active) {
+                try { ReadNames(snapshot); } catch (Exception) { } // Reads fail now and then while the app is busy, and the next one works.
+            }
+            tracker.PollNow.WaitOne(tracker.Holding ? 1 : fast || tracker.Active ? 80 : 1000);
         }
+    }
+
+    bool CaughtUp(Snapshot snapshot) {
+        Snapshot before = shown;
+        if (before == null || before.Rows.Count != snapshot.Rows.Count || snapshot.Rows.Count == 0 || before.Rows[0].Name != snapshot.Rows[0].Name) return true;
+        return snapshot.Rows[0].Bounds.Y - snapshot.WindowAt.Y == before.Rows[0].Bounds.Y - before.WindowAt.Y + tracker.Offset;
+    }
+
+    // Only with the app in front and its sidebar still, so these are the app's own pixels. What's read stays in memory.
+    void ReadNames(Snapshot snapshot) {
+        foreach (Row row in snapshot.Rows) {
+            if (!fontColors.ContainsKey(row.Name)) continue;
+            NamePlace place;
+            if (!places.TryGetValue(row.Name, out place) || place.RowSize != row.Bounds.Size) {
+                Rectangle letters = Sidebar.FindName(row);
+                if (letters.IsEmpty) continue;
+                place = new NamePlace { Box = new Rectangle(letters.X - row.Bounds.X, letters.Y - row.Bounds.Y, letters.Width, letters.Height), RowSize = row.Bounds.Size };
+                places[row.Name] = place;
+            }
+            Rectangle seen = Rectangle.Intersect(place.On(row.Bounds), snapshot.Area);
+            int beside = NameShape.LineBeside(seen, snapshot.Area.Top, snapshot.Area.Bottom);
+            if (seen.IsEmpty || beside < 0) continue;
+            int mid = seen.Y + seen.Height / 2;
+            if (!ClaudeIsAt(new Native.POINT { X = seen.Left, Y = mid }) || !ClaudeIsAt(new Native.POINT { X = seen.Left + seen.Width / 2, Y = mid }) || !ClaudeIsAt(new Native.POINT { X = seen.Right - 1, Y = mid })) continue;
+            NameShape shape;
+            bool has = shapes.TryGetValue(row.Name, out shape);
+            bool known = has && shape.RowSize == row.Bounds.Size && shape.On(row.Bounds).Contains(seen);
+            string name = row.Name;
+            if (has && !known) {
+                // Layout moved this name since it was read. Its old copy has to go before the screen can be read here, or that copy would be what's read.
+                menu.BeginInvoke((Action)(() => { NameShape gone; shapes.TryRemove(name, out gone); if (overlay != null) overlay.WipeNames(); }));
+                continue;
+            }
+            Color[] above = NameShape.ReadLine(beside, known ? shape.On(row.Bounds) : seen);
+            if (!known) {
+                shape = NameShape.Measure(NameShape.Read(seen), above);
+                if (shape == null) continue;
+                shape.Offset = new Point(seen.X - row.Bounds.X, seen.Y - row.Bounds.Y);
+                shape.RowSize = row.Bounds.Size;
+            } else if (above.SequenceEqual(shape.Above)) continue;
+            NameShape found = shape;
+            menu.BeginInvoke((Action)(() => {
+                found.Above = above;
+                shapes[name] = found;
+                RenderName(name);
+            }));
+        }
+    }
+
+    void RenderName(string name) {
+        Tint tint;
+        NameShape shape;
+        if (fontColors.TryGetValue(name, out tint) && shapes.TryGetValue(name, out shape)) shape.Render(tint);
+        if (overlay == null) return;
+        overlay.RedrawColumn();
+        overlay.WipeNames();
     }
 
     // Runs only from a right-click on a heading until the app's menu closes. The app builds the menu a moment after the click, so give it a second to appear.
@@ -948,26 +1767,34 @@ class App : ApplicationContext {
         if (overlay != null) { overlay.Hole = Rectangle.Empty; overlay.RedrawColumn(); }
     }
 
-    void ToggleColorList() {
-        if (menu.Visible || picker.Visible) { menu.Hide(); picker.Hide(); panel.Expanded = false; return; }
+    // Clicking the row whose list is open closes it. Clicking the other one swaps to its list.
+    void ToggleColorList(int item) {
+        bool wasOpen = (menu.Visible || picker.Visible) && listFor == item;
+        menu.Hide();
+        picker.Hide();
+        panel.Expanded = -1;
+        if (wasOpen) return;
+        listFor = item;
+        bool font = item == ColorPanel.FontRow;
+        IDictionary<string, Tint> chosen = font ? (IDictionary<string, Tint>)fontColors : colors;
         Row row = menuRow;
         Tint tint;
-        Tint? current = colors.TryGetValue(row.Name, out tint) ? tint : (Tint?)null;
-        var at = new Point(panel.Right + 4, panel.Top);
+        Tint? current = chosen.TryGetValue(row.Name, out tint) ? tint : (Tint?)null;
+        var at = new Point(panel.Right + 4, panel.TopOf(item));
         Action<Tint?> choose = picked => {
-            if (picked.HasValue) colors[row.Name] = picked.Value;
-            else colors.Remove(row.Name);
-            ColorFile.Save(colors);
+            if (picked.HasValue) chosen[row.Name] = picked.Value;
+            else chosen.Remove(row.Name);
+            ColorFile.Save(font ? ColorFile.FontColors : ColorFile.Highlights, chosen);
             closeAppMenu = true;
             panel.Hide();
             menu.Hide();
             picker.Hide();
-            if (overlay != null) overlay.RedrawColumn(); // Keeps its hole until the watcher sees the app's menu gone, so strips never cross it.
+            RenderName(row.Name); // The strips keep their hole until the watcher sees the app's menu gone, so they never cross it.
         };
-        panel.Expanded = true;
+        panel.Expanded = item;
         menu.Open(current, at, choose, gradient => {
             menu.Hide();
-            picker.Open(current, gradient, at, picked => choose(picked));
+            picker.Open(current, gradient, at, font ? 1 : Overlay.Strength, picked => choose(picked));
         });
     }
 
@@ -1009,12 +1836,24 @@ class App : ApplicationContext {
 
     void MoveStrips() {
         stripsQueued = false;
+        tracker.Stop();
         if (overlay != null && shown != null && shown.Rows.Count > 0) overlay.MoveColumn(ShiftOf(shown));
     }
 
     void Apply() {
-        if (tracker.Active || Moving) return; // The pixels and FollowDrag are more current than automation's positions until things stop.
         Snapshot snapshot = latest;
+        // Just after a click rows may have moved, so automation's positions are wanted. The tracker checks them against the pixels before using them, as they can be out of date.
+        if (tracker.Capturing && tracker.WatchingLayout) {
+            if (snapshot.Rows.Count == 0) tracker.Stop(); // A menu opened, which hides the page from automation and mustn't have colors over it.
+            else if (snapshot != shown && snapshot != offered && snapshot.Window == owner) {
+                offered = snapshot;
+                Scene scene = SceneOf(snapshot.Rows, ShiftOf(snapshot));
+                scene.From = snapshot;
+                tracker.Offer(scene);
+            }
+            return;
+        }
+        if (tracker.Active || Moving) return; // The pixels and FollowDrag are more current than automation's positions until things stop.
         if (snapshot == shown && tracker.Offset == 0) return;
         Snapshot previous = shown;
         shown = snapshot;
@@ -1025,12 +1864,21 @@ class App : ApplicationContext {
             overlay = null;
             owner = snapshot.Window;
             if (owner != IntPtr.Zero) {
-                overlay = new Overlay(colors);
+                overlay = new Overlay(colors, fontColors, shapes);
                 Native.SetWindowLongPtr(overlay.Handle, GWLP_HWNDPARENT, owner);
+                Native.SetWindowLongPtr(overlay.Names.Handle, GWLP_HWNDPARENT, owner);
             }
         }
         if (overlay == null) return;
         if (snapshot.Rows.Count == 0) { overlay.Hide(); return; }
+        Place(snapshot);
+        tracker.Prepare(snapshot.Area.Location);
+
+        // Catches scrolling the wheel hook can't see, like dragging the scrollbar. Foreground only, so another app's pixels are never read.
+        if (Native.GetForegroundWindow() == owner && snapshot.IsScrollOf(previous)) FollowScroll();
+    }
+
+    void Place(Snapshot snapshot) {
         overlay.RedrawColumn(); // Where the strips were.
         overlay.Rows = snapshot.Rows;
         overlay.Column = snapshot.Area;
@@ -1039,41 +1887,69 @@ class App : ApplicationContext {
         overlay.FitToScreen();
         overlay.Show();
         overlay.RedrawColumn();
-
-        // Catches scrolling the wheel hook can't see, like dragging the scrollbar. Foreground only, so another app's pixels are never read.
-        if (colors.Count > 0 && Native.GetForegroundWindow() == owner && snapshot.IsScrollOf(previous)) tracker.Start(snapshot.Area);
     }
 
-    void ShowOffset() {
-        if (overlay == null || !overlay.IsHandleCreated) return;
-        overlay.ScrollOffset = tracker.Offset + tracker.Lead;
-        overlay.RedrawColumn();
+    void FollowScroll() { Follow(false); }
+    void FollowClick() { Follow(true); }
+
+    // On the main thread, which owns all that's read here. Nothing to follow if nothing's colored, or while a menu is open or the window is moving and positions are out of date.
+    void Follow(bool clicked) {
+        if (overlay == null || !overlay.Visible || (colors.Count == 0 && fontColors.Count == 0) || menuWatching || Moving || overlay.Hole != Rectangle.Empty) return;
+        tracker.Start(() => SceneOf(overlay.Rows, overlay.Shift), clicked);
+    }
+
+    Scene SceneOf(IEnumerable<Row> rows, Point shift) {
+        return new Scene(rows, shift, overlay.PartOnScreen, overlay.Location, overlay.Handle, overlay.Names, overlay.Names.Handle, new Dictionary<string, Tint>(colors), fontColors, places, shapes);
+    }
+
+    // The strips go in place under the picture first. Then the names' window replaces the picture in one go, with pixels that match it, and it's back to the two windows.
+    void EndPicture() {
+        if (overlay == null || tracker.Capturing) return;
+        overlay.ScrollOffset = tracker.Offset;
+        overlay.Invalidate();
         overlay.Update();
+        overlay.Names.Mirroring = false;
+        overlay.WipeNames();
+        overlay.Names.Update();
+        ScrollTracker.Exclude(overlay.Handle, overlay.Names.Handle, false);
     }
 
-    // Owning a window doesn't lift it above its owner until the owner is next activated, so place it directly.
+    // Owning a window doesn't lift it above its owner until the owner is next activated, so place it directly. The names go above the strips.
     void KeepAboveOwner() {
-        const uint GW_HWNDPREV = 3, SWP_NOSIZE = 1, SWP_NOMOVE = 2, SWP_NOACTIVATE = 0x10;
         if (overlay == null || !overlay.IsHandleCreated || !overlay.Visible || !Native.IsWindow(owner)) return;
-        IntPtr above = Native.GetWindow(owner, GW_HWNDPREV);
-        if (above != overlay.Handle) Native.SetWindowPos(overlay.Handle, above, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+        PlaceAbove(owner, overlay.Handle);
+        if (overlay.Names.Visible) PlaceAbove(overlay.Handle, overlay.Names.Handle);
+    }
+
+    static void PlaceAbove(IntPtr below, IntPtr window) {
+        const uint GW_HWNDPREV = 3, SWP_NOSIZE = 1, SWP_NOMOVE = 2, SWP_NOACTIVATE = 0x10;
+        IntPtr above = Native.GetWindow(below, GW_HWNDPREV);
+        if (above != window) Native.SetWindowPos(window, above, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
     }
 
     // Called by Windows for every mouse event on the PC, so it returns at once for everything but button presses and the wheel.
     IntPtr OnMouse(int code, IntPtr wParam, IntPtr lParam) {
         int message = (int)wParam;
-        if (code < 0 || (message != WM_LBUTTONDOWN && message != WM_RBUTTONDOWN && message != WM_MBUTTONDOWN && message != WM_MOUSEWHEEL))
+        if (code < 0 || (message != WM_LBUTTONDOWN && message != WM_LBUTTONUP && message != WM_RBUTTONDOWN && message != WM_MBUTTONDOWN && message != WM_MOUSEWHEEL))
             return Native.CallNextHookEx(hook, code, wParam, lParam);
 
         var info = (Native.MouseInfo)Marshal.PtrToStructure(lParam, typeof(Native.MouseInfo));
         var point = new Point(info.Point.X, info.Point.Y);
+        bool inList = shown != null && shown.Area.Contains(point) && ClaudeIsAt(info.Point);
 
         if (message == WM_MOUSEWHEEL) {
             // Starting here, before the app has moved anything, means the very first frame of the scroll is followed.
-            if (shown != null && colors.Count > 0 && shown.Area.Contains(point) && ClaudeIsAt(info.Point)) tracker.Start(shown.Area);
+            if (inList) FollowScroll();
+            return Native.CallNextHookEx(hook, code, wParam, lParam);
+        }
+        if (message == WM_LBUTTONUP) { // The app acts on a click at the release, however long the button was held.
+            if (inList) FollowClick();
             return Native.CallNextHookEx(hook, code, wParam, lParam);
         }
 
+        // A click elsewhere could start a window drag, and other buttons can open menus, which the picture must not sit over.
+        if (message == WM_LBUTTONDOWN && inList) FollowClick();
+        else tracker.Stop();
         if (message == WM_LBUTTONDOWN && ClaudeIsAt(info.Point)) pressed.Set();
 
         // Every click goes through to the app now, so its own menu always opens. Ours only follows along.
@@ -1097,16 +1973,16 @@ class App : ApplicationContext {
     }
 
     Row RowUnder(Native.POINT raw, Point point) {
-        // While scrolling or moving, the saved row positions are out of date, so leave the click to the app.
-        if (shown == null || owner == IntPtr.Zero || tracker.Active || Moving) return null;
-        Row row = shown.RowAt(point);
+        // While moving, the saved row positions are out of date, so leave the click to the app. A scroll is exact, so its distance can be allowed for.
+        if (shown == null || owner == IntPtr.Zero || Moving) return null;
+        Row row = shown.RowAt(point, tracker.Offset);
         return row != null && ClaudeIsAt(raw) ? row : null;
     }
 
     // True only when the Claude window is what's actually on screen at that spot, not another app covering it.
     bool ClaudeIsAt(Native.POINT raw) {
         IntPtr root = Native.GetAncestor(Native.WindowFromPoint(raw), GA_ROOT);
-        return root == owner || (overlay != null && overlay.IsHandleCreated && root == overlay.Handle);
+        return root == owner || (overlay != null && overlay.IsHandleCreated && (root == overlay.Handle || root == overlay.Names.Handle));
     }
 
 }
@@ -1133,6 +2009,63 @@ static class Program {
         Environment.Exit(2);
     }
 
+    // A row with a highlight and a font color, in a frame of plain background holding one solid letter pixel and one half-covered one.
+    static unsafe void CheckBaking() {
+        const int W = 40, H = 40, Background = 0x202020, Solid = 0xE0E0E0, Half = 0x808080;
+        Color red = Color.FromArgb(0xFF, 0, 0), blue = Color.FromArgb(0, 0, 0xFF);
+        var row = new Row { Name = "x", Bounds = new Rectangle(102, 210, 30, 20) };
+        var shapes = new Dictionary<string, NameShape>();
+        var scene = new Scene(new[] { row }, Point.Empty, new Rectangle(100, 200, W, H), Point.Empty, IntPtr.Zero, null, IntPtr.Zero,
+            new Dictionary<string, Tint> { { "x", new Tint(red) } }, new Dictionary<string, Tint> { { "x", new Tint(blue) } },
+            new Dictionary<string, NamePlace> { { "x", new NamePlace { Box = new Rectangle(4, 6, 10, 6), RowSize = row.Bounds.Size } } }, shapes);
+        scene.Prepare();
+        int tinted = Scene.WithStrip(Background, red.ToArgb());
+        Expect(Scene.WithStrip(31 << 16 | 158 << 8 | 31, 197 << 16 | 249 << 8 | 34) == (81 << 16 | 185 << 8 | 32), "the strip blends as measured on the real screen");
+        foreach (int offset in new[] { 0, 5, -16 }) { // At rest, scrolled down, and with the name cut off by the list's top edge so only the line under it is left to read the background from.
+            int[] raw = Enumerable.Repeat(Background, W * H).ToArray(), baked = new int[W * H];
+            int letterY = 17 + offset;
+            raw[letterY * W + 8] = Solid;
+            raw[letterY * W + 9] = Half;
+            fixed (int* from = raw, to = baked) {
+                scene.Bake(from, to, offset);
+                Expect((baked[letterY * W + 8] & 0xFFFFFF) == 0x0000FF, "a solid letter pixel takes the font color, at offset " + offset);
+                Color halfway = MenuWindow.Mix(Color.FromArgb(tinted | unchecked((int)0xFF000000)), blue, 0.5);
+                Expect((baked[letterY * W + 9] & 0xFFFFFF) == (halfway.ToArgb() & 0xFFFFFF), "a half-covered edge lands halfway to the strip's background, at offset " + offset);
+                Expect((baked[letterY * W + 12] & 0xFFFFFF) == tinted, "the name's empty pixels just show the strip, at offset " + offset);
+                Expect(baked[(H - 1) * W + 39] == Background, "outside the row the app's pixels are untouched, at offset " + offset);
+                if (offset >= 0) Expect(baked[(10 + offset) * W + 2] == Background, "a strip's rounded corner leaves the app's pixel, at offset " + offset);
+                if (offset != 0) continue;
+                // What the names' window then draws at rest must be the same pixels.
+                scene.Settle(from, to, offset);
+                NameShape shape = shapes["x"];
+                Expect(shape.Offset == new Point(4, 6) && (shape.ColorAt(2, 1, new Tint(blue)).ToArgb() & 0xFFFFFF) == 0x0000FF, "the name's shape comes from the last frame");
+                for (int y = 0; y < 6; y++)
+                    for (int x = 0; x < 10; x++) {
+                        Color rest = shape.ColorAt(x, y, new Tint(blue));
+                        int expected = rest.ToArgb() == ClickThroughWindow.Clear.ToArgb() ? tinted : rest.ToArgb() & 0xFFFFFF;
+                        Expect((baked[(16 + y) * W + 6 + x] & 0xFFFFFF) == expected, "the picture and the names' window agree on every pixel");
+                    }
+            }
+        }
+
+        // Is a colored row where its position says? The row is 6 lines into the hashes, which start EdgeInset below the frame's top.
+        Point away = new Point(0, 0), onRow = new Point(110, 220);
+        int count = H - 2 * ScrollTracker.EdgeInset;
+        int[] lines = new int[count], moved = new int[count];
+        var hasText = new bool[count];
+        for (int y = 9; y < 15; y++) { lines[y] = 100 + y; moved[y + 5] = 100 + y; hasText[y] = true; }
+        var looks = new Dictionary<string, int[]>();
+        scene.Remember(looks, lines, hasText, 0, away);
+        Expect(scene.Fits(looks, lines, 0, away), "a row that hasn't moved fits");
+        Expect(!scene.Fits(looks, moved, 0, away), "a row that moved doesn't fit its old position, as stale automation would have it");
+        Expect(scene.Fits(looks, moved, 5, away), "a row fits at the distance it really moved");
+        Expect(scene.Fits(looks, moved, 0, onRow), "the row under the mouse changes by itself, so it isn't judged");
+        var hovered = new Dictionary<string, int[]>();
+        scene.Remember(hovered, lines, hasText, 0, onRow);
+        Expect(hovered.Count == 0, "a lit-up row's look isn't kept");
+        Expect(!scene.MoreBelow(0, count) && !scene.MoreBelow(-30, count) && scene.MoreBelow(40, count), "a colored row out of view below is noticed, and one above isn't");
+    }
+
     // Exits 0 if the logic holds and the sidebar's headings can be read, so it also shows when an app update has broken the lookup.
     static int Check() {
         Dictionary<string, Tint> parsed = ColorFile.Parse(new[] { "a=b=#112233", "g=#112233-#445566", "not a color line", "c=#nothex", "d=#112233-#nothex" });
@@ -1151,8 +2084,9 @@ static class Program {
         var sample = new Snapshot { Area = new Rectangle(0, 50, 400, 500) };
         sample.Rows.Add(new Row { Name = "x", Bounds = new Rectangle(8, 100, 358, 32) });
         sample.Rows.Add(new Row { Name = "scrolled away", Bounds = new Rectangle(8, 10, 358, 32) });
-        Expect(sample.RowAt(new Point(10, 110)) != null && sample.RowAt(new Point(10, 140)) == null, "right-click hit test");
-        Expect(sample.RowAt(new Point(10, 20)) == null, "a row scrolled out of the list can't be right-clicked");
+        Expect(sample.RowAt(new Point(10, 110), 0) != null && sample.RowAt(new Point(10, 140), 0) == null, "right-click hit test");
+        Expect(sample.RowAt(new Point(10, 20), 0) == null, "a row scrolled out of the list can't be right-clicked");
+        Expect(sample.RowAt(new Point(10, 140), 30) != null && sample.RowAt(new Point(10, 110), 30) == null, "right-clicking mid-scroll allows for the distance scrolled");
 
         var scrolled = new Snapshot { Area = sample.Area };
         scrolled.Rows.Add(new Row { Name = "x", Bounds = new Rectangle(8, 60, 358, 32) });
@@ -1164,19 +2098,40 @@ static class Program {
         // Scroll tracking: every line unique, so only the true shift can line them all up.
         int[] before = Enumerable.Range(0, 400).Select(y => y * 37 + 1).ToArray();
         bool[] text = Enumerable.Repeat(true, 400).ToArray();
-        int shift;
-        Expect(ScrollTracker.FindShift(before, before, text, out shift) && shift == 0, "an unchanged frame has no shift");
+        int shift, stray;
+        Expect(ScrollTracker.FindShift(before, before, text, out shift, out stray) && shift == 0 && stray == 0, "an unchanged frame has no shift");
         int[] after = Enumerable.Range(0, 400).Select(y => y >= 40 ? before[y - 40] : -y - 1).ToArray();
-        Expect(ScrollTracker.FindShift(before, after, text, out shift) && shift == 40, "content moved down 40 lines");
+        Expect(ScrollTracker.FindShift(before, after, text, out shift, out stray) && shift == 40, "content moved down 40 lines");
         for (int y = 200; y < 232; y++) after[y] = -y - 1000;
-        Expect(ScrollTracker.FindShift(before, after, text, out shift) && shift == 40, "a hovered row changing color doesn't throw it off");
+        Expect(ScrollTracker.FindShift(before, after, text, out shift, out stray) && shift == 40 && stray >= 32, "a hovered row changing color doesn't throw it off, and shows up as lines that don't fit");
         int[] unrelated = Enumerable.Range(0, 400).Select(y => -y - 1).ToArray();
-        Expect(!ScrollTracker.FindShift(before, unrelated, text, out shift), "a frame that matches nothing is reported as unsure");
+        Expect(!ScrollTracker.FindShift(before, unrelated, text, out shift, out stray), "a frame that matches nothing is reported as unsure");
         bool[] blank = new bool[400];
-        Expect(!ScrollTracker.FindShift(before, after, blank, out shift), "blank lines alone prove nothing");
+        Expect(!ScrollTracker.FindShift(before, after, blank, out shift, out stray), "blank lines alone prove nothing");
 
-        // Measured from the app's real menu at (210,235), 181 wide: its first item starts 6 below its top, so the row's bottom edge must land 14 below, past the rounded corner.
-        Expect(ColorPanel.BoundsFor(new Rectangle(210, 235, 181, 301)) == new Rectangle(210, 198, 181, 51), "Select color row sits on the menu's top edge");
+        // Recoloring a name, over a background that changes by column as a gradient strip's does. Column 0 has no letter in it, column 1 is all letter, column 2 half.
+        Color[] above = { Color.FromArgb(0x20, 0x40, 0x60), Color.FromArgb(0x50, 0x10, 0x10), Color.FromArgb(0x30, 0x30, 0x30) };
+        NameShape shape = NameShape.Measure(new[,] { { above[0] }, { Color.FromArgb(0xB0, 0x70, 0x70) }, { Color.FromArgb(0x60, 0x60, 0x60) } }, above);
+        var red = new Tint(Color.Red);
+        Expect(shape != null && shape.ColorAt(0, 0, red).ToArgb() == ClickThroughWindow.Clear.ToArgb(), "a pixel with no letter in it stays see-through");
+        Expect(shape.ColorAt(1, 0, red).ToArgb() == Color.Red.ToArgb(), "a pixel fully inside a letter takes the color");
+        Expect(shape.ColorAt(2, 0, red).ToArgb() == MenuWindow.Mix(above[2], Color.Red, 0.5).ToArgb(), "a half-covered edge lands halfway to the background");
+        Expect(NameShape.Measure(new[,] { { above[0] }, { above[1] }, { above[2] } }, above) == null, "pixels with no letters give no shape");
+        NameShape edge = NameShape.Measure(new[,] { { Color.FromArgb(0x60, 0x60, 0x60) }, { Color.FromArgb(0x60, 0, 0) } }, new[] { Color.Black, Color.Black });
+        Expect(edge.ColorAt(1, 0, new Tint(Color.White)).ToArgb() == Color.FromArgb(0xFF, 0, 0).ToArgb(), "a subpixel edge only changes the color channels the letter covers");
+        NameShape dark = NameShape.Measure(new[,] { { Color.FromArgb(0x20, 0x20, 0x20) }, { Color.White } }, new[] { Color.White, Color.White });
+        Expect(dark != null && dark.ColorAt(0, 0, red).ToArgb() == Color.Red.ToArgb() && dark.ColorAt(1, 0, red).ToArgb() == ClickThroughWindow.Clear.ToArgb(), "dark letters on a light background work too");
+        NameShape wide = NameShape.Measure(new[,] { { Color.White }, { Color.White }, { Color.White } }, new[] { Color.Black, Color.Black, Color.Black });
+        var sweep = new Tint(Color.Red, Color.Blue);
+        Expect(wide.ColorAt(0, 0, sweep).ToArgb() == Color.Red.ToArgb() && wide.ColorAt(2, 0, sweep).ToArgb() == Color.Blue.ToArgb(), "a gradient runs from the name's first column to its last");
+        Expect(wide.ColorAt(1, 0, new Tint(ClickThroughWindow.Clear)).ToArgb() != ClickThroughWindow.Clear.ToArgb(), "a letter can't land on the see-through color and vanish");
+
+        CheckBaking();
+
+        // Measured from the app's real menu at (210,235), 181 wide: its first item starts 6 below its top, so the rows' bottom edge must land 14 below, past the rounded corner.
+        Expect(ColorPanel.BoundsFor(new Rectangle(210, 235, 181, 301)) == new Rectangle(210, 170, 181, 79), "the color rows sit on the menu's top edge");
+        Rectangle work = Screen.PrimaryScreen.WorkingArea;
+        Expect(ColorPanel.BoundsFor(new Rectangle(work.X + 210, work.Y + 20, 181, 301)).Y == work.Y, "at the top of the screen the color rows stay on it");
         Expect(MenuWindow.Mix(Color.FromArgb(0x30, 0x30, 0x30), Color.White, 0.075).R == 0x40, "hover color matches the stylesheet's 7.5% white");
         Console.WriteLine("logic: ok");
 
@@ -1188,6 +2143,7 @@ static class Program {
                 Snapshot snapshot = Sidebar.Read(window, list);
                 Console.WriteLine("list area: " + snapshot.Area);
                 foreach (Row row in snapshot.Rows) Console.WriteLine(row.Name + " | " + row.Bounds);
+                Expect(Sidebar.Reread(window, list, snapshot).Rows.Select(r => r.Name).SequenceEqual(snapshot.Rows.Select(r => r.Name)), "rows found once can be read again without a search");
                 return snapshot.Rows.Count > 0 ? 0 : 1;
             }
             Thread.Sleep(1000);
