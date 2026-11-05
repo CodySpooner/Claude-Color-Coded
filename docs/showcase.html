@@ -1,0 +1,515 @@
+<!doctype html>
+<!--
+  Draws the README's pictures. A recreation of the sidebar with made-up names, so no real project shows.
+  The colors, the highlight blend and the menu sizes are the helper's own values.
+  docs/make-pictures.mjs turns it into images. To look at one scene, open showcase.html?scene=hero&t=5
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Claude Color Coded pictures</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..800&display=block" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  html, body { background: #07080c; }
+  body { font-family: Inter, 'Segoe UI', sans-serif; -webkit-font-smoothing: antialiased; overflow: hidden; color: #f4f4f5; }
+  #stage { position: relative; overflow: hidden; background: #07080c; }
+  .abs { position: absolute; }
+  .back { position: absolute; inset: 0; }
+
+  .eyebrow { font-size: 12.5px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase; }
+  .caption { position: absolute; text-align: center; }
+  .caption h3 { font-size: 25px; font-weight: 750; letter-spacing: -.02em; margin: 9px 0 7px; }
+  .caption p { font-size: 15px; line-height: 1.42; color: #a1a1aa; }
+
+  /* The app's sidebar, at its real sizes. */
+  .side { position: relative; background: #1f1f1f; overflow: hidden; }
+  .card { border-radius: 16px; border: 1px solid #303034; box-shadow: 0 28px 70px rgba(0,0,0,.65); }
+  .navrow { display: flex; align-items: center; gap: 10px; height: 34px; padding-left: 14px; font-size: 15px; color: #e6e6e6; }
+  .navrow svg { width: 17px; height: 17px; fill: none; stroke: #d4d4d4; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  .list { position: relative; overflow: hidden; }
+  .content { position: relative; }
+  .head { position: relative; height: 32px; margin: 2px 0; font-size: 13px; font-weight: 650; }
+  .strip { position: absolute; left: 4px; right: 6px; top: 0; bottom: 0; border-radius: 8px; opacity: 0; }
+  .name { position: absolute; left: 13px; top: 0; line-height: 32px; white-space: nowrap; }
+  .name.base { color: #bdbdbd; }
+  .name.ink { opacity: 0; -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .caret { position: absolute; top: 12.5px; width: 7px; height: 7px; fill: #9a9a9a; }
+  .row { position: relative; height: 34px; line-height: 34px; padding-left: 14px; font-size: 15px; color: #e6e6e6; white-space: nowrap; }
+  .row.sub { padding-left: 34px; }
+  .row.sub::before { content: ''; position: absolute; left: 18px; top: 0; bottom: 0; width: 1px; background: #3d3d3d; }
+
+  /* The app's menu and the helper's rows and lists, at the helper's sizes. */
+  .menu { position: absolute; background: #303030; border: 1px solid #383838; border-radius: 14px; padding: 5px; box-shadow: 0 18px 50px rgba(0,0,0,.6); font-size: 14px; font-weight: 500; color: #f0f0f0; }
+  .item { position: relative; display: flex; align-items: center; height: 28px; padding: 0 10px; border-radius: 8px; white-space: nowrap; }
+  .item.on { background: #3f3f3f; }
+  .item.red { color: #f87171; }
+  .item .more { margin-left: auto; width: 6px; height: 10px; fill: none; stroke: #f0f0f0; stroke-width: 1.5; }
+  .item .dot { flex: none; width: 14px; height: 14px; border-radius: 50%; margin-right: 8px; }
+  .item .tick { margin-left: auto; width: 13px; height: 11px; fill: none; stroke: #f0f0f0; stroke-width: 1.5; }
+  .sep { height: 1px; margin: 4px 10px; background: #383838; }
+
+  .picker { position: absolute; width: 212px; background: #303030; border: 1px solid #383838; border-radius: 14px; padding: 12px; box-shadow: 0 18px 50px rgba(0,0,0,.6); font-size: 14px; font-weight: 500; color: #f0f0f0; }
+  .chips { display: flex; gap: 10px; margin-bottom: 10px; }
+  .chip { flex: 1; display: flex; align-items: center; height: 28px; padding-left: 8px; border-radius: 8px; }
+  .chip.on { background: #3f3f3f; }
+  .chip .dot { width: 14px; height: 14px; border-radius: 50%; margin-right: 6px; }
+  .preview { height: 24px; border-radius: 8px; margin-bottom: 10px; }
+  .square { position: relative; height: 120px; border-radius: 8px; margin-bottom: 10px; }
+  .hue { position: relative; height: 14px; border-radius: 7px; background: linear-gradient(90deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00); }
+  .handle { position: absolute; width: 11px; height: 11px; margin: -5.5px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
+  .apply { height: 28px; line-height: 28px; padding-left: 4px; margin-top: 14px; }
+
+  .pane { position: absolute; top: 0; bottom: 0; background: #262626; border-left: 1px solid #333; }
+  .bar { position: absolute; height: 10px; border-radius: 5px; background: #383838; }
+  .bubble { position: absolute; border-radius: 14px; background: #333; }
+
+  .pill { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 13px; font-weight: 700; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<script>
+const C = { red: '#EF4444', orange: '#F97316', yellow: '#EAB308', green: '#22C55E', teal: '#14B8A6', blue: '#3B82F6', purple: '#A855F7', pink: '#EC4899' }
+const stage = document.getElementById('stage')
+
+// The helper's exact blend for a highlight over the app's background.
+const rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16))
+const hex = a => '#' + a.map(v => v.toString(16).padStart(2, '0')).join('')
+const tint = h => hex(rgb(h).map(v => Math.floor((v * 76 + 127) / 255) + Math.floor((0x1f * 179 + 127) / 255)))
+const fade = (h, a) => { const [r, g, b] = rgb(h); return `rgba(${r},${g},${b},${a})` }
+const across = list => list.length > 1 ? `linear-gradient(90deg,${list.join(',')})` : list[0]
+const inks = list => `linear-gradient(90deg,${list.concat(list.length > 1 ? [] : list).join(',')})`
+
+const el = (cls, html = '', style = '', parent) => {
+  const e = document.createElement('div')
+  e.className = cls
+  e.innerHTML = html
+  if (style) e.style.cssText = style
+  if (parent) parent.appendChild(e)
+  return e
+}
+const ramp = (t, a, b) => { const x = Math.max(0, Math.min(1, (t - a) / (b - a))); return x * x * (3 - 2 * x) }
+const pulse = (t, a, up, down) => t < a ? 0 : t < a + up ? ramp(t, a, a + up) : 1 - ramp(t, a + up, a + up + down)
+
+// Made-up groups. Don't use real project names here: these pictures are public.
+const GROUPS = [
+  { name: 'Portfolio Site', hi: [C.green], kids: ['Landing page', 'Contact form', { name: 'Image cleanup', nested: ['Compress photos', 'Alt text pass', 'Retina icons'] }, 'Launch checklist'] },
+  { name: 'Mobile App', hi: [C.blue, C.purple], ink: ['#bfdbfe', '#f5d0fe'] },
+  { name: 'Client Work', hi: [C.orange], ink: ['#fde047'] },
+  { name: 'Game Jam', hi: [C.purple], ink: ['#f9a8d4', '#fdba74'], kids: ['Level editor', 'Sound pass', 'Boss fight'] },
+  { name: 'Home Lab', hi: [C.teal] },
+  { name: 'Reading List', ink: ['#f472b6', '#fbbf24'] },
+  { name: 'Invoices', hi: [C.red] },
+  { name: 'Blog Redesign', hi: [C.yellow], ink: ['#fef08a'], kids: ['Draft the post', 'New header', 'Fix old links'] },
+  { name: 'Music Player', hi: [C.pink] },
+  { name: 'Tax Season', hi: [C.blue], kids: ['Receipts', 'Mileage log'] },
+  { name: 'Recipes', ink: [C.green, C.teal] },
+]
+
+const ICONS = {
+  New: '<path d="M8.5 2.5v12M2.5 8.5h12"/>',
+  Search: '<circle cx="7.5" cy="7.5" r="5"/><path d="M11.5 11.5l3.5 3.5"/>',
+  Artifacts: '<rect x="2.5" y="5.5" width="8" height="9" rx="1.5"/><path d="M6 3h7a1.5 1.5 0 0 1 1.5 1.5V12"/>',
+  Customize: '<rect x="2" y="5" width="13" height="9.5" rx="1.5"/><path d="M6 5V3.5A1 1 0 0 1 7 2.5h3a1 1 0 0 1 1 1V5"/>',
+  More: '<circle cx="3.5" cy="8.5" r=".8"/><circle cx="8.5" cy="8.5" r=".8"/><circle cx="13.5" cy="8.5" r=".8"/>',
+}
+const svg = paths => `<svg viewBox="0 0 17 17">${paths}</svg>`
+
+function sidebar(groups, { width = 290, height, nav = true, card = true } = {}) {
+  const side = el('side' + (card ? ' card' : ''), '', `width:${width}px;height:${height}px`)
+  let top = 10
+  if (nav) {
+    el('', Object.keys(ICONS).map(k => `<div class="navrow">${svg(ICONS[k])}${k}</div>`).join(''), 'padding-top:10px', side)
+    top = 10 + 34 * 5 + 22
+  }
+  const list = el('list', '', `position:absolute;left:0;right:0;top:${top}px;bottom:0`, side)
+  const content = el('content', '', '', list)
+  const heads = groups.map(g => {
+    const head = el('head', '', '', content)
+    head.strip = el('strip', '', g.hi ? `background:${across(g.hi.map(tint))}` : '', head)
+    el('name base', g.name, '', head)
+    head.ink = el('name ink', g.name, `background-image:${g.ink ? inks(g.ink) : 'linear-gradient(#f0f0f0,#f0f0f0)'}`, head)
+    const caret = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+    caret.setAttribute('viewBox', '0 0 7 7')
+    caret.classList.add('caret')
+    caret.innerHTML = g.kids ? '<path d="M0 1.5h7L3.5 6z"/>' : '<path d="M1.5 0v7L6 3.5z"/>'
+    head.appendChild(caret)
+    head.caret = caret
+    for (const kid of g.kids || []) {
+      el('row', kid.name || kid, '', content)
+      for (const s of kid.nested || []) el('row sub', s, '', content)
+    }
+    return head
+  })
+  // The caret follows the name, once the font is in and widths are real.
+  const place = () => heads.forEach(h => { h.caret.style.left = 13 + h.querySelector('.name').offsetWidth + 8 + 'px' })
+  const color = (i, amount) => {
+    heads[i].strip.style.opacity = amount
+    heads[i].ink.style.opacity = amount
+  }
+  const colorAll = amount => heads.forEach((_, i) => color(i, amount))
+  return { side, list, content, heads, place, color, colorAll, top }
+}
+
+const moreArrow = '<svg class="more" viewBox="0 0 6 10"><path d="M1 1l4 4-4 4"/></svg>'
+const tick = '<svg class="tick" viewBox="0 0 13 11"><path d="M1 6l4 4 7-9"/></svg>'
+
+function appMenu({ rows = true, hover = -1, expanded = -1, count = 8, width = 196 } = {}) {
+  const menu = el('menu', '', `width:${width}px`)
+  const items = []
+  const add = (label, cls = '') => { const i = el('item ' + cls, label, '', menu); items.push(i); return i }
+  if (rows) {
+    add('Select font color' + moreArrow)
+    add('Select color' + moreArrow)
+    el('sep', '', '', menu)
+    menu.rows = items.slice()
+  }
+  const sections = [['New session'], ['Save as environment', 'Move down', 'Sort A to Z'], ['Select all'], ['Collapse all', 'Expand all']]
+  sections.forEach((section, i) => {
+    section.forEach(label => add(label))
+    el('sep', '', '', menu)
+  })
+  add(`Archive all (${count})`)
+  add(`Delete all sessions (${count})`, 'red')
+  if (hover >= 0) items[hover].classList.add('on')
+  if (expanded >= 0) items[expanded].classList.add('on')
+  menu.items = items
+  return menu
+}
+
+const CHOICES = [['Red', C.red], ['Orange', C.orange], ['Yellow', C.yellow], ['Green', C.green], ['Teal', C.teal], ['Blue', C.blue], ['Purple', C.purple], ['Pink', C.pink]]
+const HUE = 'conic-gradient(from 90deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)'
+
+function colorList({ current = -1, hover = -1 } = {}) {
+  const menu = el('menu', '', 'width:176px')
+  const items = []
+  CHOICES.forEach(([name, color], i) => {
+    items.push(el('item', `<span class="dot" style="background:${color}"></span>${name}${i === current ? tick : ''}`, '', menu))
+  })
+  el('sep', '', '', menu)
+  items.push(el('item', `<span class="dot" style="background:${HUE}"></span>Custom color…`, '', menu))
+  items.push(el('item', `<span class="dot" style="background:linear-gradient(90deg,${C.blue},${C.purple})"></span>Gradient…`, '', menu))
+  items.push(el('item', '<span class="dot"></span>No color', '', menu))
+  if (hover >= 0) items[hover].classList.add('on')
+  menu.items = items
+  return menu
+}
+
+function picker() {
+  const left = '#3B82F6', right = '#EC4899'
+  const box = el('picker')
+  el('chips', `<div class="chip on"><span class="dot" style="background:${left}"></span>Left</div><div class="chip"><span class="dot" style="background:${right}"></span>Right</div>`, '', box)
+  el('preview', '', `background:linear-gradient(90deg,${fade(left, .3)},${fade(right, .3)})`, box)
+  const square = el('square', '', `background:linear-gradient(transparent,#000),linear-gradient(90deg,#fff,#2f73ff)`, box)
+  el('handle', '', 'left:75%;top:6%', square)
+  const hue = el('hue', '', '', box)
+  el('handle', '', 'left:60%;top:50%', hue)
+  el('sep', '', 'margin:14px -6px 0', box)
+  el('apply', 'Apply', 'margin-top:4px', box)
+  return box
+}
+
+function backdrop(glows, rings) {
+  const gradient = glows.map(g => `radial-gradient(${g.r}px ${g.r}px at ${g.x}px ${g.y}px,${fade(g.c, g.a)},transparent)`).join(',')
+  el('back', '', `background:${gradient}`, stage)
+  if (!rings) return
+  const circles = rings.radii.map((r, i) => `<circle cx="${rings.x}" cy="${rings.y}" r="${r}" fill="none" stroke="#fff" stroke-opacity=".055" ${i === rings.radii.length - 2 ? 'stroke-width="7" stroke-dasharray="1.5 15" stroke-opacity=".1"' : ''}/>`).join('')
+  el('back', `<svg width="100%" height="100%">${circles}</svg>`, '', stage)
+}
+
+function caption(x, y, width, color, eyebrow, title, line) {
+  el('caption', `<div class="eyebrow" style="color:${color}">${eyebrow}</div><h3>${title}</h3><p>${line}</p>`, `left:${x - width / 2}px;top:${y}px;width:${width}px`, stage)
+}
+
+// Chrome draws a layer with perspective at the page's scale, which blurs its text, so the contents are laid out at double size and scaled back.
+function tilted(x, y, w, h, perspective, turn) {
+  const outer = el('abs', '', `left:${x}px;top:${y}px;width:${w}px;height:${h}px;transform-origin:0 0;transform:translate(${w / 2}px,${h / 2}px) perspective(${perspective}px) ${turn} translate(${-w / 2}px,${-h / 2}px) scale(.5)`, stage)
+  return el('', '', `position:relative;zoom:2;width:${w}px;height:${h}px`, outer)
+}
+
+function attach(parent, child, style) {
+  child.style.cssText += ';' + style
+  parent.appendChild(child)
+  return child
+}
+
+const cursorArt = '<svg width="20" height="24" viewBox="0 0 20 24"><path d="M2 1.5v17.2l4.7-4.2 3.1 7 3.3-1.5-3.1-6.9h6.3z" fill="#fff" stroke="#111" stroke-width="1.4" stroke-linejoin="round"/></svg>'
+
+// The first picture: a real pick, the rest of the colors arriving, then a scroll they stay attached through.
+function hero(width, height, still, footer) {
+  backdrop([
+    { x: 880, y: 150, r: 620, c: C.blue, a: .2 },
+    { x: 1190, y: 480, r: 520, c: C.pink, a: .16 },
+    { x: 590, y: 520, r: 460, c: C.green, a: .1 },
+    { x: 90, y: 40, r: 520, c: C.purple, a: .13 },
+  ], { x: 760, y: height / 2 + 10, radii: [230, 360, 500, 660] })
+
+  const text = el('abs', '', `left:60px;top:${height / 2 - 170}px;width:520px`, stage)
+  el('eyebrow', 'Unofficial mod for the Claude desktop app', 'color:#fb923c', text)
+  const titleColors = [C.red, C.orange, C.yellow, C.green, C.teal, C.blue, C.purple, C.pink, C.red]
+  const word = `<span id="word" style="background:linear-gradient(90deg,${titleColors.join(',')});background-size:200% 100%;-webkit-background-clip:text;background-clip:text;color:transparent">Color</span>`
+  el('', `Claude<br>${word} Coded`, 'font-size:74px;font-weight:800;line-height:1.02;letter-spacing:-.035em;margin:16px 0 20px', text)
+  el('', 'Right-click a group, pick a color.<br>It stays on its row, even mid-scroll.', 'font-size:21px;line-height:1.42;color:#b4b4bd', text)
+  const dots = el('', '', 'display:flex;gap:10px;margin-top:26px', text)
+  const swatches = CHOICES.map(([, c]) => el('', '', `width:20px;height:20px;border-radius:50%;background:${c};opacity:.22`, dots))
+  if (footer) el('', footer, 'font-size:15px;color:#71717a;margin-top:30px', text)
+
+  const rig = tilted(600, (height - 600) / 2 - 4, 290, 660, 1700, 'rotateY(-7deg) rotateX(2deg)')
+  const bar = sidebar(GROUPS, { width: 290, height: 660 })
+  rig.appendChild(bar.side)
+  bar.place()
+
+  // The colors again at a size you can read in a small picture.
+  const lifts = [
+    { g: 1, label: 'Gradient highlight and name' },
+    { g: 2, label: 'Highlight and name' },
+    { g: 5, label: 'Name only' },
+  ].map(({ g, label }, i) => {
+    const group = GROUPS[g]
+    const hue = (group.hi || group.ink)[0]
+    const box = el('abs', '', `left:942px;top:${height / 2 - 192 + i * 132}px;width:292px`, stage)
+    el('', label, 'font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#a1a1aa;margin:0 0 10px 3px', box)
+    const card = el('', `<span style="background-image:${group.ink ? inks(group.ink) : 'linear-gradient(#f0f0f0,#f0f0f0)'};-webkit-background-clip:text;background-clip:text;color:transparent">${group.name}</span>`, `height:64px;line-height:64px;padding-left:20px;border-radius:15px;font-size:25px;font-weight:700;letter-spacing:-.01em;background:${group.hi ? across(group.hi.map(tint)) : '#1f1f1f'};border:1px solid ${fade(hue, .75)};box-shadow:0 0 42px ${fade(hue, .42)},0 16px 36px rgba(0,0,0,.5)`, box)
+    return { box, at: 3.0 + (g * .11) + .1, phase: i * 2.1, top: height / 2 - 192 + i * 132 }
+  })
+  const firstHeadY = bar.top + bar.heads[0].offsetTop + 16
+  const menu = attach(rig, appMenu(), `left:136px;top:${firstHeadY - 8}px;transform-origin:0 0`)
+  const list = attach(rig, colorList(), `left:336px;top:${firstHeadY + 32}px;transform-origin:0 0`)
+  const cursor = el('abs', cursorArt, 'z-index:5', rig)
+  const ripple = el('abs', '', 'width:34px;height:34px;margin:-17px;border-radius:50%;border:2px solid #fff;opacity:0', rig)
+
+  const greenItem = list.items[3]
+  const headAt = { x: 130, y: firstHeadY }
+  const colorRow = { x: 200, y: firstHeadY - 8 + 5 + 28 + 14 }
+  const greenAt = { x: 400, y: firstHeadY + 32 + 5 + 28 * 3 + 14 }
+  const park = { x: 200, y: 420 }
+  const path = [
+    [0, { x: 520, y: 380 }], [.35, { x: 520, y: 380 }], [1.05, headAt], [1.45, headAt], [1.8, colorRow], [2.1, colorRow],
+    [2.55, greenAt], [2.85, greenAt], [3.3, park], [7.9, park], [8.5, { x: 520, y: 380 }],
+  ]
+  const cursorAt = t => {
+    for (let i = 1; i < path.length; i++) {
+      if (t <= path[i][0]) {
+        const k = ramp(t, path[i - 1][0], path[i][0])
+        return { x: path[i - 1][1].x + (path[i][1].x - path[i - 1][1].x) * k, y: path[i - 1][1].y + (path[i][1].y - path[i - 1][1].y) * k }
+      }
+    }
+    return path[path.length - 1][1]
+  }
+  const range = bar.content.offsetHeight - bar.list.offsetHeight
+  const word_ = document.getElementById('word')
+  const cascade = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+  const seek = t => {
+    const out = 1 - ramp(t, 8.05, 8.45)
+    cascade.forEach((g, i) => {
+      const at = i === 0 ? 2.9 : 3.0 + i * .11
+      const on = ramp(t, at, at + .2) * out
+      bar.color(g, on)
+      const glow = pulse(t, at, .1, .5) * .9
+      const hue = (GROUPS[g].hi || GROUPS[g].ink)[0]
+      bar.heads[g].strip.style.boxShadow = glow > 0 ? `0 0 ${26 * glow}px ${fade(hue, glow)}` : 'none'
+    })
+    swatches.forEach((s, i) => { s.style.opacity = .22 + .78 * ramp(t, 3.0 + i * .12, 3.2 + i * .12) * out })
+    const scroll = range * (ramp(t, 4.3, 5.5) - ramp(t, 5.9, 7.2))
+    bar.content.style.transform = `translateY(${-scroll}px)`
+    const menuOn = ramp(t, 1.45, 1.55) * (1 - ramp(t, 2.85, 2.93))
+    menu.style.opacity = menuOn
+    menu.style.transform = `scale(${.97 + .03 * menuOn})`
+    menu.style.display = menuOn ? '' : 'none'
+    menu.rows[1].classList.toggle('on', t > 1.72 && t < 2.93)
+    const listOn = ramp(t, 2.12, 2.2) * (1 - ramp(t, 2.85, 2.93))
+    list.style.opacity = listOn
+    list.style.transform = `scale(${.97 + .03 * listOn})`
+    list.style.display = listOn ? '' : 'none'
+    greenItem.classList.toggle('on', t > 2.48)
+    const c = cursorAt(t)
+    cursor.style.left = c.x + 'px'
+    cursor.style.top = c.y + 'px'
+    const clicks = [1.42, 2.08, 2.84]
+    let ring = 0, ringAt = c
+    clicks.forEach(at => { if (t >= at && t < at + .3) { ring = 1 - (t - at) / .3; ringAt = cursorAt(at) } })
+    ripple.style.opacity = ring * .75
+    ripple.style.left = ringAt.x + 'px'
+    ripple.style.top = ringAt.y + 'px'
+    ripple.style.transform = `scale(${1.1 - ring * .7})`
+    lifts.forEach(l => {
+      l.box.style.opacity = ramp(t, l.at, l.at + .25) * out
+      l.box.style.top = l.top + Math.sin(t / 8.8 * Math.PI * 2 + l.phase) * 5 + 'px'
+    })
+    word_.style.backgroundPosition = `${(t / 8.8) * 200}% 0`
+  }
+  if (still) {
+    seek(4)
+    bar.heads.forEach(h => { h.strip.style.boxShadow = 'none' })
+    swatches.forEach(s => { s.style.opacity = 1 })
+    lifts.forEach(l => { l.box.style.opacity = 1; l.box.style.top = l.top + 'px' })
+    cursor.style.display = 'none'
+    return
+  }
+  return seek
+}
+
+const SCENES = {
+  hero: { width: 1280, height: 600, build: () => hero(1280, 600) },
+
+  social: { width: 1280, height: 640, build: () => hero(1280, 640, true, 'github.com/CodySpooner/Claude-Color-Coded') },
+
+  compare: {
+    width: 1000, height: 640,
+    build() {
+      backdrop([
+        { x: 770, y: 220, r: 420, c: C.purple, a: .24 },
+        { x: 860, y: 420, r: 330, c: C.pink, a: .16 },
+        { x: 620, y: 110, r: 320, c: C.green, a: .15 },
+      ], { x: 500, y: 240, radii: [130, 250, 380, 520] })
+      const shown = GROUPS.map(g => ({ ...g, kids: undefined }))
+      const plain = sidebar(shown, { height: 420, nav: false })
+      const coded = sidebar(shown, { height: 420, nav: false })
+      const fadeOut = 'mask-image:linear-gradient(#000 82%,transparent);-webkit-mask-image:linear-gradient(#000 82%,transparent)'
+      attach(tilted(92, 40, 290, 420, 1300, 'rotateY(9deg)'), plain.side, `filter:saturate(.9) brightness(.92);${fadeOut}`)
+      attach(tilted(618, 40, 290, 420, 1300, 'rotateY(-9deg)'), coded.side, fadeOut)
+      plain.place(); coded.place()
+      coded.colorAll(1)
+      el('abs', '<svg width="72" height="72" viewBox="0 0 72 72"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#3B82F6"/><stop offset="1" stop-color="#EC4899"/></linearGradient></defs><path d="M22 10l28 26-28 26" fill="none" stroke="url(#g)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/></svg>', 'left:464px;top:196px;filter:drop-shadow(0 0 16px rgba(168,85,247,.8))', stage)
+      caption(237, 478, 400, '#a1a1aa', 'Before', 'Every group looks the same', 'A long sidebar means reading each name<br>to find the one you want.')
+      caption(763, 478, 400, '#f472b6', 'After', 'See your project at a glance', 'Highlights and name colors look like part<br>of the app, and they\'re yours to choose.')
+    },
+  },
+
+  steps: {
+    width: 1000, height: 640,
+    build() {
+      backdrop([
+        { x: 170, y: 170, r: 300, c: C.blue, a: .2 },
+        { x: 500, y: 200, r: 320, c: C.purple, a: .22 },
+        { x: 830, y: 170, r: 300, c: C.blue, a: .22 },
+      ], { x: 500, y: 230, radii: [150, 270, 400, 540] })
+      const fadeOut = 'mask-image:linear-gradient(#000 80%,transparent);-webkit-mask-image:linear-gradient(#000 80%,transparent)'
+      const shown = GROUPS.map(g => ({ ...g, kids: undefined }))
+
+      // 1: the rows in the app's menu.
+      const one = sidebar(shown, { width: 272, height: 440, nav: false })
+      attach(stage, one.side, `position:absolute;left:32px;top:34px;${fadeOut}`)
+      one.place()
+      one.heads[1].strip.style.cssText += ';opacity:1;background:#303030'
+      const menu = attach(stage, appMenu({ rows: true, expanded: -1, width: 190 }), 'left:96px;top:96px')
+      const rows = el('menu', '', 'left:66px;top:66px;width:250px;padding:7px;font-size:17px;border-color:#6d9eff;box-shadow:0 0 44px rgba(59,130,246,.62),0 18px 50px rgba(0,0,0,.6)', stage)
+      el('item', 'Select font color' + moreArrow, 'height:36px', rows)
+      el('item', 'Select color' + moreArrow, 'height:36px', rows)
+
+      // 2: the list of colors.
+      const two = sidebar(shown, { width: 272, height: 440, nav: false })
+      attach(stage, two.side, `position:absolute;left:364px;top:34px;filter:brightness(.72);${fadeOut}`)
+      two.place()
+      const list = attach(stage, colorList({ hover: 5, current: 5 }), 'left:388px;top:56px;width:224px;padding:7px;font-size:17px;border-color:#a78bfa;box-shadow:0 0 44px rgba(168,85,247,.55),0 18px 50px rgba(0,0,0,.6)')
+      list.querySelectorAll('.item').forEach(i => { i.style.height = '36px' })
+      list.querySelectorAll('.dot').forEach(d => { d.style.width = d.style.height = '18px'; d.style.marginRight = '11px' })
+
+      // 3: the group with its color.
+      const three = sidebar(shown, { width: 272, height: 440, nav: false })
+      attach(stage, three.side, `position:absolute;left:696px;top:34px;${fadeOut}`)
+      three.place()
+      three.color(1, 1)
+      const lifted = sidebar([{ name: 'Mobile App', hi: [C.blue] }], { width: 262, height: 48, nav: false, card: false })
+      attach(stage, lifted.side, 'position:absolute;left:681px;top:80px;transform-origin:0 50%;transform:scale(1.16);border-radius:14px;border:1px solid #6d9eff;box-shadow:0 0 44px rgba(59,130,246,.7),0 18px 40px rgba(0,0,0,.6)')
+      lifted.list.style.top = '5px'
+      lifted.place()
+      lifted.color(0, 1)
+
+      caption(168, 494, 310, '#60a5fa', 'Right-click', 'Two new rows', 'At the top of Claude\'s own menu,<br>drawn to match it.')
+      caption(500, 494, 310, '#c084fc', 'Pick', 'Choose a color', 'Eight colors, any custom color,<br>or a two-color gradient.')
+      caption(832, 494, 310, '#60a5fa', 'Done', 'It stays colored', 'Saved by group name, and back<br>again the next time it starts.')
+    },
+  },
+
+  colors: {
+    width: 1000, height: 560,
+    build() {
+      backdrop([
+        { x: 170, y: 190, r: 300, c: C.orange, a: .15 },
+        { x: 500, y: 200, r: 320, c: C.blue, a: .24 },
+        { x: 830, y: 190, r: 300, c: C.pink, a: .18 },
+      ], { x: 500, y: 215, radii: [160, 280, 410, 550] })
+      const solid = CHOICES.map(([name, c]) => ({ name, hi: [c] }))
+      const one = sidebar(solid, { width: 276, height: 330, nav: false })
+      attach(stage, one.side, 'position:absolute;left:30px;top:36px')
+      one.list.style.top = '20px'
+      one.place()
+      one.colorAll(1)
+      one.heads.forEach(h => { h.caret.style.display = 'none' })
+
+      const box = picker()
+      attach(stage, box, 'left:0;top:0;transform-origin:0 0;transform:translate(378px,36px) scale(1.14);border-color:#6d9eff;box-shadow:0 0 50px rgba(59,130,246,.5),0 18px 50px rgba(0,0,0,.6)')
+
+      const samples = [
+        { name: 'Highlight only', hi: [C.teal] },
+        { name: 'Name only', ink: ['#fbbf24'] },
+        { name: 'Highlight and name', hi: [C.purple], ink: ['#fde047'] },
+        { name: 'Gradient highlight', hi: [C.orange, C.pink] },
+        { name: 'Gradient name', ink: ['#38bdf8', '#f472b6'] },
+        { name: 'Gradient on both', hi: [C.blue, C.purple], ink: ['#a7f3d0', '#fbcfe8'] },
+        { name: 'No color', },
+      ]
+      const three = sidebar(samples, { width: 276, height: 330, nav: false })
+      attach(stage, three.side, 'position:absolute;left:694px;top:36px')
+      three.list.style.top = '20px'
+      three.place()
+      three.heads.forEach((h, i) => { if (samples[i].hi || samples[i].ink) three.color(i, 1); h.caret.style.display = 'none'; h.style.marginBottom = '9px' })
+
+      caption(168, 404, 300, '#fb923c', 'One click', 'Eight colors', 'Ready to go, for the highlight<br>or the group\'s name.')
+      caption(500, 404, 300, '#60a5fa', 'Any shade', 'Custom and gradient', 'Pick any color, or a left and<br>a right color to blend.')
+      caption(832, 404, 300, '#f472b6', 'Your call', 'Mix them freely', 'Highlights and names are set<br>on their own, per group.')
+    },
+  },
+
+  locked: {
+    width: 1000, height: 520,
+    build() {
+      backdrop([
+        { x: 250, y: 260, r: 340, c: C.red, a: .1 },
+        { x: 750, y: 240, r: 380, c: C.green, a: .17 },
+      ], { x: 500, y: 250, radii: [150, 270, 400, 540] })
+      const shown = GROUPS
+      const make = x => {
+        const bar = sidebar(shown, { width: 380, height: 372, nav: false })
+        attach(stage, bar.side, `position:absolute;left:${x}px;top:94px`)
+        bar.place()
+        bar.colorAll(1)
+        return bar
+      }
+      const a = make(70), b = make(550)
+      el('abs', '<span style="font-size:21px;font-weight:750;letter-spacing:-.02em">An ordinary overlay</span>&nbsp;&nbsp;<span class="pill" style="background:rgba(239,68,68,.17);color:#fca5a5">drifts</span>', 'left:70px;top:42px', stage)
+      el('abs', '<span style="font-size:21px;font-weight:750;letter-spacing:-.02em">Claude Color Coded</span>&nbsp;&nbsp;<span class="pill" style="background:rgba(34,197,94,.17);color:#86efac">locked on</span>', 'left:550px;top:42px', stage)
+      el('abs', 'Illustration in slow motion, with sample names', 'left:0;right:0;top:482px;text-align:center;font-size:14px;color:#71717a', stage)
+      const range = a.content.offsetHeight - a.list.offsetHeight
+      const scrollAt = t => range * (ramp(t, .4, 2.2) - ramp(t, 3, 4.8))
+      return t => {
+        const now = scrollAt(t), late = scrollAt(t - .09) // Fast real scrolls reach 4400 px/s, where a frame or two late is about 50 px, and this peaks near that.
+        a.content.style.transform = b.content.style.transform = `translateY(${-now}px)`
+        a.heads.forEach(h => {
+          // The colors are drawn over the moving text, so they land after it.
+          const off = `translateY(${now - late}px)`
+          h.strip.style.transform = off
+          h.ink.style.transform = off
+          h.querySelector('.base').style.opacity = h.ink.style.opacity
+        })
+        b.heads.forEach(h => { h.querySelector('.base').style.opacity = 0 })
+      }
+    },
+  },
+}
+
+const query = new URLSearchParams(location.search)
+const scene = SCENES[query.get('scene') || 'hero']
+stage.style.width = scene.width + 'px'
+stage.style.height = scene.height + 'px'
+window.ready = document.fonts.load('650 20px Inter').then(() => document.fonts.ready).then(() => {
+  window.seek = scene.build() || (() => {})
+  window.seek(Number(query.get('t') || 0))
+  return true
+})
+</script>
+</body>
+</html>

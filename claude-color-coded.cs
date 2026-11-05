@@ -23,6 +23,12 @@ using System.Threading;
 using System.Windows.Automation;
 using System.Windows.Forms;
 
+[assembly: System.Reflection.AssemblyTitle("Claude Color Coded")]
+[assembly: System.Reflection.AssemblyProduct("Claude Color Coded")]
+[assembly: System.Reflection.AssemblyCompany("Xody")]
+[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.0")]
+
 static class Native {
     public delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
     public struct POINT { public int X, Y; }
@@ -1874,7 +1880,8 @@ class App : ApplicationContext {
         Place(snapshot);
         tracker.Prepare(snapshot.Area.Location);
 
-        // Catches scrolling the wheel hook can't see, like dragging the scrollbar. Foreground only, so another app's pixels are never read.
+        // Catches scrolling the wheel hook can't see, like dragging the scrollbar. Foreground only here, because no click or wheel turn says the user is in the app.
+        // The wheel and click paths check only the cursor point, so a window overlapping part of the sidebar is read along with it, for those moments, and only redrawn in place.
         if (Native.GetForegroundWindow() == owner && snapshot.IsScrollOf(previous)) FollowScroll();
     }
 
@@ -2137,15 +2144,17 @@ static class Program {
 
         // The first query can come back nearly empty: it's what switches the app's accessibility tree on.
         for (int attempt = 0; attempt < 10; attempt++) {
-            IntPtr window = Sidebar.FindWindow();
-            AutomationElement list = window == IntPtr.Zero ? null : Sidebar.FindList(window);
-            if (list != null) {
-                Snapshot snapshot = Sidebar.Read(window, list);
-                Console.WriteLine("list area: " + snapshot.Area);
-                foreach (Row row in snapshot.Rows) Console.WriteLine(row.Name + " | " + row.Bounds);
-                Expect(Sidebar.Reread(window, list, snapshot).Rows.Select(r => r.Name).SequenceEqual(snapshot.Rows.Select(r => r.Name)), "rows found once can be read again without a search");
-                return snapshot.Rows.Count > 0 ? 0 : 1;
-            }
+            try {
+                IntPtr window = Sidebar.FindWindow();
+                AutomationElement list = window == IntPtr.Zero ? null : Sidebar.FindList(window);
+                if (list != null) {
+                    Snapshot snapshot = Sidebar.Read(window, list), again = Sidebar.Reread(window, list, snapshot);
+                    Console.WriteLine("list area: " + snapshot.Area);
+                    foreach (Row row in snapshot.Rows) Console.WriteLine(row.Name + " | " + row.Bounds);
+                    Expect(again.Rows.Select(r => r.Name).SequenceEqual(snapshot.Rows.Select(r => r.Name)), "rows found once can be read again without a search");
+                    return snapshot.Rows.Count > 0 ? 0 : 1;
+                }
+            } catch (Exception) { } // Measured: reads fail now and then while the app's layout changes, and the next one works.
             Thread.Sleep(1000);
         }
         Console.WriteLine("no group headings found: is the Code tab showing, with the sidebar open?");
