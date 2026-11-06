@@ -1566,6 +1566,7 @@ class App : ApplicationContext {
     Row menuRow; // The heading that was right-clicked, and the window that took the click.
     IntPtr menuTarget;
     Rectangle menuArea; // The app's own menu, while the color rows are attached to it.
+    bool rowsWaiting; // Hidden only because another window covers the app's menu.
     int listFor = -1; // Which color row the open list or picker belongs to.
     volatile bool closeAppMenu, menuWatching;
 
@@ -1580,7 +1581,7 @@ class App : ApplicationContext {
         hookProc = OnMouse;
         hook = Native.SetWindowsHookEx(WH_MOUSE_LL, hookProc, Native.GetModuleHandle(null), 0);
 
-        timer.Tick += (s, e) => { Apply(); KeepAboveOwner(); };
+        timer.Tick += (s, e) => { Apply(); KeepAboveOwner(); KeepRowsWithAppMenu(); };
         timer.Start();
 
         // UI Automation runs off this thread: the mouse hook lives here, and a slow read must never lag the mouse.
@@ -1777,8 +1778,25 @@ class App : ApplicationContext {
         if (overlay != null) { overlay.Hole = area; overlay.RedrawColumn(); }
     }
 
+    // The rows are always on top and the app's menu isn't, so they wait while another window covers it.
+    // ponytail: checks one spot, on the menu's left side, which the rows and color list don't reach. A window over only another part of the menu goes unnoticed.
+    void KeepRowsWithAppMenu() {
+        if (menuArea.IsEmpty) return;
+        bool covered = !ClaudeIsAt(new Native.POINT { X = menuArea.X + 16, Y = menuArea.Y + menuArea.Height / 2 });
+        if (covered && panel.Visible) {
+            rowsWaiting = true;
+            panel.Hide();
+            menu.Hide();
+            picker.Hide();
+        } else if (!covered && rowsWaiting) {
+            rowsWaiting = false;
+            panel.Place(menuArea);
+        }
+    }
+
     void HidePanel() {
         menuArea = Rectangle.Empty;
+        rowsWaiting = false;
         panel.Hide();
         menu.Hide();
         picker.Hide();
@@ -1976,7 +1994,8 @@ class App : ApplicationContext {
         bool inAppMenu = menuArea.Contains(point) && ClaudeIsAt(info.Point); // Up to the app. If that closes its menu, the watcher hides ours.
         if (onOurs || inAppMenu) return Native.CallNextHookEx(hook, code, wParam, lParam);
 
-        if (panel.Visible) menu.BeginInvoke((Action)HidePanel);
+        // A click in another app leaves the app's menu open, so ours stays too and the strips keep their hole.
+        if (panel.Visible && ClaudeIsAt(info.Point)) menu.BeginInvoke((Action)HidePanel);
         if (message == WM_RBUTTONDOWN) {
             Row row = RowUnder(info.Point, point);
             if (row != null) WatchForAppMenu(row, Native.WindowFromPoint(info.Point));
