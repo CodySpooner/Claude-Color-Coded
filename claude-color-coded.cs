@@ -26,8 +26,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("Claude Color Coded")]
 [assembly: System.Reflection.AssemblyProduct("Claude Color Coded")]
 [assembly: System.Reflection.AssemblyCompany("Xody")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.0.1.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.1")]
 
 static class Native {
     public delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
@@ -752,6 +752,11 @@ static class Sidebar {
         return null;
     }
 
+    // Measured: for a moment as a menu opens, every heading's button reports the same parent, as tall as the whole list. Drawn, that's one strip filling the sidebar.
+    public static bool IsRow(Rectangle box, Rectangle list) {
+        return box.Width > 0 && box.Height > 0 && box.Height < list.Height / 2;
+    }
+
     public static Snapshot Read(IntPtr window, AutomationElement list) {
         var snapshot = new Snapshot { Window = window, Area = ToRectangle(list.Current.BoundingRectangle) };
         foreach (AutomationElement button in Buttons(list)) {
@@ -760,7 +765,7 @@ static class Sidebar {
             // The button's parent is the full heading row. Rows scrolled out of view are kept: none on screen doesn't mean none exist.
             AutomationElement parent = TreeWalker.RawViewWalker.GetParent(button);
             Rectangle row = ToRectangle(parent.Current.BoundingRectangle);
-            if (row.Width > 0 && row.Height > 0)
+            if (IsRow(row, snapshot.Area))
                 snapshot.Rows.Add(new Row { Name = name.Substring(Prefix.Length), Bounds = row, Element = parent });
         }
         return snapshot;
@@ -1145,6 +1150,13 @@ abstract class MenuWindow : Form {
             cp.ExStyle |= 0x80 | 0x08000000 | 0x00080000 | 0x8;
             return cp;
         }
+    }
+
+    // Measured: ordinary windows can end up stacked above always-on-top ones, and showing a window doesn't raise it, so this could open hidden behind the app's window.
+    protected override void OnVisibleChanged(EventArgs e) {
+        base.OnVisibleChanged(e);
+        const uint SWP_NOSIZE = 1, SWP_NOMOVE = 2, SWP_NOACTIVATE = 0x10;
+        if (Visible) Native.SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE); // HWND_TOPMOST
     }
 
     protected override void WndProc(ref Message m) {
@@ -2094,6 +2106,7 @@ static class Program {
         Expect(sample.RowAt(new Point(10, 110), 0) != null && sample.RowAt(new Point(10, 140), 0) == null, "right-click hit test");
         Expect(sample.RowAt(new Point(10, 20), 0) == null, "a row scrolled out of the list can't be right-clicked");
         Expect(sample.RowAt(new Point(10, 140), 30) != null && sample.RowAt(new Point(10, 110), 30) == null, "right-clicking mid-scroll allows for the distance scrolled");
+        Expect(Sidebar.IsRow(new Rectangle(8, 100, 358, 32), sample.Area) && !Sidebar.IsRow(sample.Area, sample.Area), "a heading row is kept, and a parent as tall as the whole list isn't");
 
         var scrolled = new Snapshot { Area = sample.Area };
         scrolled.Rows.Add(new Row { Name = "x", Bounds = new Rectangle(8, 60, 358, 32) });
