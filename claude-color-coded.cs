@@ -26,8 +26,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("Claude Color Coded")]
 [assembly: System.Reflection.AssemblyProduct("Claude Color Coded")]
 [assembly: System.Reflection.AssemblyCompany("Xody")]
-[assembly: System.Reflection.AssemblyVersion("1.0.1.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.0.1")]
+[assembly: System.Reflection.AssemblyVersion("1.0.2.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.2")]
 
 static class Native {
     public delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
