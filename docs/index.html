@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Color Coded: color-code the Claude desktop app's sidebar</title>
+<meta name="description" content="Right-click a group, pick a highlight or a name color, and find your projects at a glance. Solid colors or gradients, and they stay on their rows even mid-scroll. An unofficial, open source Windows helper.">
+<meta name="theme-color" content="#0d0d0f">
+<link rel="canonical" href="https://codyspooner.github.io/Claude-Color-Coded/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f1f1f'/%3E%3Crect x='6' y='7' width='20' height='5' rx='2' fill='%2322C55E'/%3E%3Crect x='6' y='14' width='20' height='5' rx='2' fill='%233B82F6'/%3E%3Crect x='6' y='21' width='20' height='5' rx='2' fill='%23EC4899'/%3E%3C/svg%3E">
+<link rel="preload" href="fonts/inter.woff2" as="font" type="font/woff2" crossorigin>
+<meta property="og:type" content="website">
+<meta property="og:title" content="Claude Color Coded: color-code the Claude desktop app's sidebar">
+<meta property="og:description" content="Right-click a group, pick a color, and it stays on its row even mid-scroll. Unofficial, open source, Windows.">
+<meta property="og:url" content="https://codyspooner.github.io/Claude-Color-Coded/">
+<meta property="og:image" content="https://codyspooner.github.io/Claude-Color-Coded/images/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+@font-face{font-family:Inter;src:url(fonts/inter.woff2) format("woff2");font-weight:100 900;font-display:swap}
+
+:root{
+  --bg:#0d0d0f;--app:#1f1f1f;--raised:#303030;--line:#2e2e33;--text:#f4f4f5;--muted:#adadb6;
+  --red:#ef4444;--orange:#f97316;--yellow:#eab308;--green:#22c55e;--teal:#14b8a6;--blue:#3b82f6;--purple:#a855f7;--pink:#ec4899;
+  --edge:clamp(16px,4vw,48px);--top:64px;
+}
+*{box-sizing:border-box;margin:0}
+html{background:var(--bg);color:var(--text);font:400 17px/1.6 Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased;scroll-padding-top:calc(var(--top) + 16px)}
+body{overflow-x:clip}
+img,video{display:block;max-width:100%;height:auto}
+a{color:inherit}
+code{font:500 .9em ui-monospace,Consolas,monospace;color:#e4e4e7}
+:focus-visible{outline:3px solid #fff;outline-offset:2px;border-radius:4px}
+.skip{position:fixed;left:16px;top:-80px;z-index:30;padding:10px 16px;background:#fff;color:var(--bg);border-radius:8px}
+.skip:focus{top:12px}
+.wrap{max-width:1180px;margin-inline:auto;padding-inline:var(--edge)}
+.lead{color:var(--muted);max-width:60ch}
+section{padding-block:clamp(52px,7vw,96px)}
+
+/* Section headings wear the same highlight as a sidebar row: 30% of the color over the app's gray */
+h2{position:relative;display:flex;align-items:center;gap:14px;padding:clamp(10px,1.4vw,16px) clamp(14px,2vw,22px);border-radius:12px;font-size:clamp(25px,3.6vw,40px);font-weight:750;line-height:1.15;letter-spacing:-.02em;background:color-mix(in srgb,var(--c) 30%,var(--app));margin-bottom:clamp(20px,3vw,32px)}
+h2::after{content:"";flex:none;width:0;height:0;border-left:7px solid transparent;border-right:7px solid transparent;border-top:9px solid color-mix(in srgb,var(--c) 40%,#fff);margin-top:3px}
+h3{font-size:20px;font-weight:700;line-height:1.3}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:50px;padding:0 24px;border-radius:12px;border:1px solid #3f3f46;font:inherit;font-weight:650;text-decoration:none;color:var(--text);background:transparent;cursor:pointer;touch-action:manipulation;transition:background .2s,border-color .2s,scale .15s}
+.btn:hover{border-color:#71717a}
+.btn:active{scale:.97}
+.btn.primary{background:#fff;border-color:#fff;color:#0d0d0f}
+.btn.primary:hover{background:#e4e4e7}
+
+/* Bar */
+.bar{position:sticky;top:0;z-index:20;background:rgba(13,13,15,.86);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.bar .wrap{display:flex;align-items:center;gap:8px;height:var(--top)}
+.brand{display:flex;align-items:center;gap:10px;min-height:44px;margin-right:auto;font-weight:750;font-size:16px;letter-spacing:-.01em;text-decoration:none;white-space:nowrap}
+.dots{display:flex;gap:3px}
+.dots i{width:6px;height:20px;border-radius:2px}
+.bar nav{display:flex}
+.bar nav a{display:inline-flex;align-items:center;min-height:44px;padding:0 12px;font-size:15px;font-weight:550;color:var(--muted);text-decoration:none;transition:color .2s}
+.bar nav a:hover{color:var(--text)}
+
+/* Hero */
+.hero{display:grid;grid-template-columns:minmax(0,.86fr) minmax(0,1fr);gap:clamp(28px,5vw,64px);align-items:center;padding-block:clamp(36px,5vw,64px) clamp(44px,6vw,72px)}
+.eyebrow{font-size:13px;font-weight:700;letter-spacing:.17em;text-transform:uppercase;color:var(--orange)}
+h1{margin-top:14px;font-size:clamp(44px,5.4vw,72px);font-weight:800;line-height:1.02;letter-spacing:-.035em}
+h1 em{font-style:normal;background:linear-gradient(90deg,#22c55e,#3b82f6,#a855f7,#ec4899,#f97316);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero .lead{margin-top:20px}
+.swatches{display:flex;flex-wrap:wrap;gap:10px;margin-top:20px}
+.swatches i{width:18px;height:18px;border-radius:50%}
+.actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:28px}
+.facts{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:4px 18px;margin-top:20px;font-size:14px;color:var(--muted)}
+.facts li::before{content:"";display:inline-block;width:6px;height:6px;margin-right:8px;border-radius:50%;background:var(--green);vertical-align:2px}
+
+/* The sidebar demo, at the app's real sizes */
+.app{position:relative;display:grid;grid-template-columns:minmax(0,290px) minmax(0,1fr);grid-template-rows:minmax(0,1fr);height:540px;border:1px solid #303034;border-radius:16px;background:#262626;overflow:hidden;box-shadow:0 28px 70px rgba(0,0,0,.65)}
+.side{position:relative;background:var(--app);min-width:0}
+.list{list-style:none;height:100%;margin:0;padding:10px 0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#3d3d3d transparent}
+.head{position:relative;display:block;width:100%;height:32px;margin:2px 0;padding:0;border:0;background:none;font:650 13px/32px Inter,sans-serif;color:#bdbdbd;text-align:left;cursor:context-menu;touch-action:manipulation}
+.head:focus-visible{outline-offset:-2px}
+.strip{position:absolute;left:4px;right:6px;top:0;bottom:0;border-radius:8px;opacity:0;transition:opacity .3s}
+.head.lit .strip{opacity:1}
+.name{position:absolute;left:13px;top:0;white-space:nowrap;background-clip:text;-webkit-background-clip:text}
+.head.inked .name{color:transparent}
+.head:not(.lit):hover .strip{opacity:.5;background:#2b2b2b}
+.caret{position:absolute;top:13px;width:0;height:0;border-top:3.5px solid transparent;border-bottom:3.5px solid transparent;border-left:5px solid #9a9a9a;pointer-events:none}
+.row{height:34px;padding-left:14px;font-size:15px;line-height:34px;color:#e6e6e6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pane{padding:64px 24px;display:grid;gap:12px;align-content:start}
+.pane i{height:10px;border-radius:5px;background:#383838}
+.pane b{display:block;height:84px;margin:12px 0 12px 18%;border-radius:14px;background:#333}
+.menu{position:absolute;z-index:5;left:12px;width:min(236px,calc(100% - 24px));padding:5px;border:1px solid #383838;border-radius:14px;background:var(--raised);box-shadow:0 18px 50px rgba(0,0,0,.6)}
+.menu[hidden]{display:none}
+.menu{max-height:calc(100% - 16px);overflow-y:auto}
+.item{display:flex;align-items:center;gap:8px;width:100%;min-height:32px;padding:0 10px;border:0;border-radius:8px;background:none;font:400 14px Inter,sans-serif;color:#f0f0f0;text-align:left;cursor:pointer}
+.item:hover,.item:focus-visible{background:#3f3f3f;outline:0}
+.item i{flex:none;width:14px;height:14px;border-radius:50%}
+.item[disabled]{color:#9a9a9a;cursor:default;background:none}
+.item input{position:absolute;opacity:0;width:0;height:0}
+.item .more{margin-left:auto;color:#a8a8a8}
+.sep{height:1px;margin:4px 10px;background:#454545}
+.under{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:0 16px;min-height:44px;margin-top:8px;font-size:14px;color:var(--muted)}
+.link{min-height:44px;padding:0;border:0;background:none;font:inherit;color:var(--text);text-decoration:underline;text-underline-offset:3px;cursor:pointer}
+
+/* Colors */
+.split{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(24px,5vw,64px);align-items:start}
+.choices{display:grid;gap:18px}
+.choices p{margin-top:2px;color:var(--muted)}
+.samples{display:grid;gap:14px;padding:clamp(16px,3vw,28px);border:1px solid var(--line);border-radius:16px;background:var(--app)}
+.samples div{display:grid;gap:6px}
+.samples small{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.samples b{display:block;padding:9px 14px;border-radius:8px;font-size:17px;font-weight:650;color:#bdbdbd}
+.samples b span{-webkit-background-clip:text;background-clip:text}
+
+/* Tables */
+.scroll{overflow-x:auto;border:1px solid var(--line);border-radius:12px}
+table{width:100%;min-width:560px;border-collapse:collapse;font-size:16px}
+th,td{padding:12px 16px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+tr:last-child td,tr:last-child th{border-bottom:0}
+thead th{font-size:13px;font-weight:650;color:var(--muted)}
+tbody th{font-weight:600}
+td{color:var(--muted)}
+.film{width:100%;margin-block:4px 24px;border:1px solid var(--line);border-radius:16px;background:var(--app)}
+.note{margin-top:14px;font-size:15px;color:var(--muted);max-width:76ch}
+
+/* Install */
+.ways{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.way{padding:clamp(18px,2.6vw,28px);border:1px solid var(--line);border-radius:16px;background:var(--app)}
+.way p,.way ol{margin-top:10px;color:var(--muted);font-size:16px}
+.way ol{padding-left:20px}
+.way .btn{margin-top:16px}
+.warn{padding-left:12px;border-left:3px solid var(--yellow)}
+.warn b{color:var(--text)}
+.cmd{margin-top:14px;border:1px solid var(--line);border-radius:12px;background:#141416;overflow:hidden}
+.cmd div{display:flex;align-items:center;justify-content:space-between;padding-left:14px;border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}
+.cmd pre{margin:0;padding:12px 14px;font:500 14px/1.6 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.copy{min-width:70px;min-height:44px;border:0;border-left:1px solid var(--line);background:none;color:var(--text);font:600 13px Inter,sans-serif;cursor:pointer;touch-action:manipulation}
+.copy:hover{background:#26262a}
+.after{margin-top:20px;max-width:76ch;color:var(--muted)}
+
+/* Help */
+details{border-bottom:1px solid var(--line)}
+details:first-of-type{border-top:1px solid var(--line)}
+summary{display:flex;align-items:center;gap:12px;min-height:56px;font-weight:600;cursor:pointer;list-style:none}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"";flex:none;width:0;height:0;border-top:5px solid transparent;border-bottom:5px solid transparent;border-left:7px solid var(--muted);transition:rotate .2s}
+details[open] summary::before{rotate:90deg}
+details>div{padding:0 0 18px 19px;color:var(--muted);max-width:78ch}
+details ul{padding-left:18px;display:grid;gap:6px}
+details p+p,details p+.cmd{margin-top:8px}
+
+footer{padding-block:28px;border-top:1px solid var(--line);font-size:15px;color:var(--muted)}
+footer .wrap{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:space-between}
+footer a{display:inline-block;padding-block:10px}
+
+@media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms!important}}
+@media (max-width:900px){
+  .hero,.split,.ways{grid-template-columns:minmax(0,1fr)}
+  .bar nav a:not(.keep){display:none}
+}
+@media (max-width:560px){
+  .app{grid-template-columns:minmax(0,1fr);height:500px}
+  .pane{display:none}
+  .brand{font-size:15px}
+  .bar nav a{padding:0 8px}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="#top"><span class="dots" aria-hidden="true"><i style="background:var(--green)"></i><i style="background:var(--blue)"></i><i style="background:var(--pink)"></i></span>Claude Color Coded</a>
+    <nav aria-label="Sections">
+      <a href="#colors">Colors</a><a href="#stays">Why it stays on</a><a href="#sees">What it can see</a><a class="keep" href="#install">Install</a><a class="keep" href="https://github.com/CodySpooner/Claude-Color-Coded">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<div class="wrap hero" id="top">
+  <div>
+    <p class="eyebrow">Unofficial helper for the Claude desktop app</p>
+    <h1>Claude<br><em>Color</em> Coded</h1>
+    <p class="lead">Right-click a group, pick a highlight or a name color, and find your projects at a glance. Solid colors or gradients, and they stay on their rows even mid-scroll.</p>
+    <div class="swatches" aria-hidden="true"><i style="background:var(--red)"></i><i style="background:var(--orange)"></i><i style="background:var(--yellow)"></i><i style="background:var(--green)"></i><i style="background:var(--teal)"></i><i style="background:var(--blue)"></i><i style="background:var(--purple)"></i><i style="background:var(--pink)"></i></div>
+    <div class="actions">
+      <a class="btn primary" href="#install">Get it for Windows</a>
+      <a class="btn" href="https://github.com/CodySpooner/Claude-Color-Coded">View the source</a>
+    </div>
+    <ul class="facts">
+      <li>No network connections</li>
+      <li>No admin rights</li>
+      <li>Never changes Claude's files</li>
+      <li>MIT license</li>
+    </ul>
+  </div>
+  <div>
+    <div class="app">
+      <div class="side" id="side">
+        <ul class="list" id="list" aria-label="A sample sidebar. Choose a group to color it."></ul>
+        <div class="menu" id="menu" role="menu" hidden></div>
+      </div>
+      <div class="pane" aria-hidden="true"><i style="width:62%"></i><i style="width:84%"></i><i style="width:48%"></i><b></b><i style="width:74%"></i><i style="width:56%"></i></div>
+    </div>
+    <div class="under">
+      <span id="status" aria-live="polite">Try it: right-click a group, or tap it on a phone.</span>
+      <button class="link" id="clear" type="button">Clear all colors</button>
+    </div>
+  </div>
+</div>
+
+<section id="colors" style="padding-top:0">
+  <div class="wrap">
+    <h2 style="--c:var(--green)">Colors</h2>
+    <div class="split">
+      <div class="choices">
+        <div><h3>Eight colors</h3><p>Red, orange, yellow, green, teal, blue, purple or pink.</p></div>
+        <div><h3>Custom color</h3><p>A color picker, for any shade.</p></div>
+        <div><h3>Gradient</h3><p>A left and a right color, blended across the row or the name.</p></div>
+        <div><h3>Highlight, name, or both</h3><p><b>Select color</b> sets a group's highlight, and <b>Select font color</b> sets the color of its name. Your colors are saved by group name and come back each time it starts.</p></div>
+      </div>
+      <div class="samples" aria-label="Four sample rows">
+        <div><small>Highlight only</small><b style="background:color-mix(in srgb,var(--green) 30%,var(--app))">Portfolio Site</b></div>
+        <div><small>Gradient highlight and name</small><b style="background:linear-gradient(90deg,color-mix(in srgb,var(--blue) 30%,var(--app)),color-mix(in srgb,var(--purple) 30%,var(--app)))"><span style="background-image:linear-gradient(90deg,#bfdbfe,#f5d0fe);color:transparent">Mobile App</span></b></div>
+        <div><small>Highlight and name</small><b style="background:color-mix(in srgb,var(--orange) 30%,var(--app));color:#fde047">Client Work</b></div>
+        <div><small>Name only</small><b style="background:#1f1f1f"><span style="background-image:linear-gradient(90deg,#f472b6,#fbbf24);color:transparent">Reading List</span></b></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="stays" style="padding-top:0">
+  <div class="wrap">
+    <h2 style="--c:var(--blue)">Why it stays on</h2>
+    <video class="film" data-play muted loop playsinline preload="none" width="1250" height="650" poster="media/locked.webp" aria-label="Two sidebars scrolling in slow motion. On the left, an ordinary overlay: highlights and name colors slide off their rows. On the right, Claude Color Coded: they stay exactly on their rows.">
+      <source src="media/locked.mp4" type="video/mp4">
+    </video>
+    <p class="lead" style="margin-bottom:24px">A window drawn over an app always lands a frame or two behind it, so ordinary overlays slide off their text as you scroll. This one doesn't draw over the sidebar while it moves. It reads each new frame, paints the colors into that frame, and shows the result as one picture, so text and color can't separate. Clicks still pass through to the app.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">Tested with a real mouse</th><th scope="col">Result</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Scrolling with the wheel</th><td>15 of 15 scrolls landed exactly, and the highlight's distance from its text never changed in 4,268 measurements</td></tr>
+          <tr><th scope="row">Expanding and collapsing groups</th><td>No wrong pictures in 1,156 frames</td></tr>
+          <tr><th scope="row">Stopping in the middle of a scroll</th><td>12 of 12 ended in the right place</td></tr>
+          <tr><th scope="row">Moving the window</th><td>6 ms behind the cursor, compared with 2–3 ms with no helper running</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">These come from one PC: Windows 11, dark mode, 100% scaling, a 165 Hz screen. The cost is that an expand or collapse appears about 100 ms after the click, because the picture waits until the new row positions match what's on screen.</p>
+  </div>
+</section>
+
+<section id="install" style="padding-top:0">
+  <div class="wrap">
+    <h2 style="--c:var(--orange)">Install</h2>
+    <p class="lead" style="margin-bottom:24px">You need 64-bit Windows and the Claude desktop app. You don't need admin rights. There's no window to open, only an icon in the system tray.</p>
+    <div class="ways">
+      <div class="way">
+        <h3>Use the installer</h3>
+        <p>Download the latest setup file and run it. It installs for your Windows account only and starts with Windows.</p>
+        <a class="btn primary" href="https://github.com/CodySpooner/Claude-Color-Coded/releases/latest">Download from GitHub</a>
+        <p class="warn"><b>Not code-signed.</b> The installer has no publisher certificate, so Windows may warn you about it. If you'd rather not override a warning, build it yourself instead. Each release lists the file's SHA256.</p>
+      </div>
+      <div class="way">
+        <h3>Build it yourself</h3>
+        <p>It's one C# file, compiled with the compiler that comes with Windows.</p>
+        <div class="cmd"><div>PowerShell<button class="copy" type="button">Copy</button></div><pre><code>git clone https://github.com/CodySpooner/Claude-Color-Coded.git
+cd Claude-Color-Coded
+.\build.cmd
+.\ClaudeColorCoded.exe</code></pre></div>
+        <p>To start it when you sign in, type <code>shell:startup</code> into File Explorer's address bar and put a shortcut to <code>ClaudeColorCoded.exe</code> in the folder that opens.</p>
+      </div>
+    </div>
+    <p class="after">Then open the <b>Code</b> tab in Claude with the sidebar showing, and right-click a group heading. <b>Select font color</b> and <b>Select color</b> appear at the top of the menu.</p>
+  </div>
+</section>
+
+<section id="sees" style="padding-top:0">
+  <div class="wrap">
+    <h2 style="--c:var(--teal)">What it can see</h2>
+    <p class="lead" style="margin-bottom:24px">This is a separate program, not a plugin, and it doesn't change the app's files. The program makes no network connections.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th scope="col">It uses</th><th scope="col">For</th><th scope="col">What's kept</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Windows UI Automation, the API screen readers use</th><td>Finding each heading's name and position. The app's accessibility tree also holds chat text, which is only compared against a button label.</td><td>Nothing</td></tr>
+          <tr><th scope="row">A system-wide mouse hook</th><td>Noticing right-clicks on headings, clicks and scrolling in the sidebar, and window drags.</td><td>Nothing is recorded</td></tr>
+          <tr><th scope="row">Screen pixels</th><td>For about a third of a second after each scroll or click in the sidebar, the area the sidebar covers, including any other window overlapping it. Also the open menu, to match its colors, and each colored name with Claude in front, to draw it.</td><td>Held in memory and only redrawn in place. The program never saves them, but if it crashes, Windows may write its memory to a crash file on your PC.</td></tr>
+          <tr><th scope="row">Two text files in <code>%LOCALAPPDATA%\ClaudeColorCoded</code></th><td><code>colors.txt</code> and <code>font-colors.txt</code> hold your group names and their colors.</td><td>Until you delete them</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="help" style="padding-top:0">
+  <div class="wrap">
+    <h2 style="--c:var(--purple)">Help</h2>
+    <details>
+      <summary>Update</summary>
+      <div><p>With the installer, download the latest setup file and run it. It replaces the earlier version and keeps your colors.</p><p>If you built it, quit it from the tray icon, run <code>git pull</code> and <code>.\build.cmd</code> in its folder, then start it again.</p></div>
+    </details>
+    <details>
+      <summary>Uninstall</summary>
+      <div><p>With the installer, uninstall it from Windows Settings &gt; Apps. If you built it, quit it from the tray icon, then delete its folder and any shortcut you made.</p><p>Your saved colors are in <code>%LOCALAPPDATA%\ClaudeColorCoded</code>, so delete that folder too if you don't want them. It never changes Claude's own files, so there's nothing to undo in the app.</p></div>
+    </details>
+    <details>
+      <summary>The color rows don't appear</summary>
+      <div>Check that the tray icon is there and that you're right-clicking a group heading, not a session. Then run the check below.</div>
+    </details>
+    <details>
+      <summary>It stopped working after a Claude update</summary>
+      <div><p>It relies on the app's English <code>New session in &lt;name&gt;</code> button label and one of its class names, so an update or another display language can break it. Run this in its folder. It lists the headings it can read, or says what failed:</p><div class="cmd"><div>PowerShell<button class="copy" type="button">Copy</button></div><pre><code>.\ClaudeColorCoded.exe --check | Out-String</code></pre></div></div>
+    </details>
+    <details>
+      <summary>Windows or your antivirus blocks it</summary>
+      <div>Please don't override a warning you're unsure about. <a href="https://github.com/CodySpooner/Claude-Color-Coded/issues">Open an issue</a> instead, so it can be looked at. The program isn't code-signed, and it uses a mouse hook and reads the screen, which security software can question. The whole program is one file, <a href="https://github.com/CodySpooner/Claude-Color-Coded/blob/main/claude-color-coded.cs">claude-color-coded.cs</a>, if you want to read it.</div>
+    </details>
+    <details>
+      <summary>Known limits</summary>
+      <div><ul>
+        <li>It has only been tested on Windows 11 in dark mode. Sizes assume 100% display scaling, and scrolling was tested on a 165 Hz screen.</li>
+        <li>Screen recordings and screenshots taken during a scroll, or just after a click in the sidebar, don't show the colors.</li>
+        <li>On a rotated screen it uses an older, slower way of reading the screen, so scrolling there may look less smooth.</li>
+        <li>A heading that newly appears can take up to 5 seconds to get its colors.</li>
+        <li>HDR hasn't been tested.</li>
+        <li>Picking a color closes the app's menu by sending it the Esc key. If that menu closes by itself in the same instant, the key reaches the app instead, where it could stop a running session.</li>
+        <li>The color picker is mouse-only, so you can't type a hex code.</li>
+        <li>Colors follow a group's name, so a group whose name changes loses its colors.</li>
+        <li>While the sidebar straddles two screens, the part on the other screen has no colors.</li>
+      </ul><p style="margin-top:12px"><a href="https://github.com/CodySpooner/Claude-Color-Coded#limits">See every known limit</a></p></div>
+    </details>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Made by <a href="https://github.com/CodySpooner">Xody</a>. <a href="https://github.com/CodySpooner/Claude-Color-Coded/blob/main/LICENSE">MIT license</a>.</span>
+    <span>An unofficial community project, not made by or affiliated with Anthropic.</span>
+  </div>
+</footer>
+
+<script>
+const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const $ = id => document.getElementById(id);
+
+// The program's own eight colors, and its blend for a highlight over the app's gray.
+const C = { Red: '#EF4444', Orange: '#F97316', Yellow: '#EAB308', Green: '#22C55E', Teal: '#14B8A6', Blue: '#3B82F6', Purple: '#A855F7', Pink: '#EC4899' };
+const tint = h => 'rgb(' + [1, 3, 5].map(i => Math.floor((parseInt(h.slice(i, i + 2), 16) * 76 + 127) / 255) + Math.floor((0x1f * 179 + 127) / 255)).join() + ')';
+const across = list => list.length > 1 ? `linear-gradient(90deg,${list.join()})` : list[0];
+const PAIRS = [[C.Blue, C.Purple], [C.Pink, C.Orange], [C.Teal, C.Green], [C.Red, C.Yellow]];
+
+// Made-up groups, the same ones as the README's pictures.
+const GROUPS = [
+  { name: 'Portfolio Site', hi: [C.Green], kids: ['Landing page', 'Contact form'] },
+  { name: 'Mobile App', hi: [C.Blue, C.Purple], ink: ['#bfdbfe', '#f5d0fe'] },
+  { name: 'Client Work', hi: [C.Orange], ink: ['#fde047'] },
+  { name: 'Game Jam', hi: [C.Purple], ink: ['#f9a8d4', '#fdba74'], kids: ['Level editor', 'Sound pass', 'Boss fight'] },
+  { name: 'Home Lab', hi: [C.Teal] },
+  { name: 'Reading List', ink: ['#f472b6', '#fbbf24'] },
+  { name: 'Invoices', hi: [C.Red] },
+  { name: 'Blog Redesign', hi: [C.Yellow], ink: ['#fef08a'], kids: ['Draft the post', 'New header'] },
+  { name: 'Music Player', hi: [C.Pink] },
+  { name: 'Tax Season', hi: [C.Blue], kids: ['Receipts', 'Mileage log'] },
+  { name: 'Recipes', ink: [C.Green, C.Teal] }
+];
+
+const list = $('list'), menu = $('menu'), side = $('side'), say = $('status');
+const groups = GROUPS.map(g => {
+  const li = document.createElement('li');
+  const head = document.createElement('button');
+  head.className = 'head';
+  head.type = 'button';
+  head.setAttribute('aria-haspopup', 'menu');
+  head.innerHTML = '<span class="strip"></span><span class="name"></span><span class="caret"></span>';
+  head.querySelector('.name').textContent = g.name;
+  li.append(head);
+  (g.kids || []).forEach(k => { const r = document.createElement('div'); r.className = 'row'; r.textContent = k; li.append(r); });
+  list.append(li);
+  head.addEventListener('click', () => openMenu(group));
+  head.addEventListener('contextmenu', e => { e.preventDefault(); openMenu(group); });
+  const group = { name: g.name, head, hi: null, ink: null, start: g };
+  return group;
+});
+document.fonts?.ready.then(() => groups.forEach(g => { g.head.querySelector('.caret').style.left = g.head.querySelector('.name').offsetWidth + 21 + 'px'; }));
+
+function paint(g) {
+  const strip = g.head.querySelector('.strip'), name = g.head.querySelector('.name');
+  g.head.classList.toggle('lit', !!g.hi);
+  strip.style.background = g.hi ? across(g.hi.map(tint)) : '';
+  g.head.classList.toggle('inked', !!g.ink);
+  name.style.backgroundImage = g.ink ? `linear-gradient(90deg,${(g.ink.length > 1 ? g.ink : [g.ink[0], g.ink[0]]).join()})` : '';
+}
+
+function item(label, onPick, dot) {
+  const b = document.createElement('button');
+  b.className = 'item'; b.type = 'button'; b.setAttribute('role', 'menuitem');
+  if (dot) { const i = document.createElement('i'); i.style.background = dot; b.append(i); }
+  b.append(label);
+  b.addEventListener('click', onPick);
+  return b;
+}
+function place(g) {
+  menu.hidden = false;
+  const top = g.head.getBoundingClientRect().bottom - side.getBoundingClientRect().top + 4;
+  menu.style.top = Math.max(8, Math.min(top, side.clientHeight - menu.offsetHeight - 8)) + 'px';
+  menu.querySelector('button:not([disabled])').focus({ preventScroll: true });
+}
+let opened = null, pair = 0;
+function openMenu(g) {
+  opened = g;
+  const none = document.createElement('div'); none.className = 'sep';
+  const session = item(`New session in ${g.name}`); session.disabled = true;
+  const more = t => { const s = document.createElement('span'); s.className = 'more'; s.textContent = '›'; s.setAttribute('aria-hidden', 'true'); const b = item(t, () => colors(g, t === 'Select color' ? 'hi' : 'ink')); b.append(s); return b; };
+  menu.replaceChildren(more('Select font color'), more('Select color'), none, session);
+  place(g);
+}
+function colors(g, kind) {
+  const label = kind === 'hi' ? 'highlight' : 'name color';
+  const set = (value, words) => { g.touched = true; g[kind] = value; paint(g); say.textContent = `${g.name}: ${words} ${label}.`; closeMenu(); };
+  const custom = document.createElement('label');
+  custom.className = 'item'; custom.setAttribute('role', 'menuitem');
+  const well = document.createElement('input'); well.type = 'color'; well.value = '#3b82f6'; well.setAttribute('aria-label', 'Custom color');
+  well.addEventListener('input', () => { g.touched = true; g[kind] = [well.value]; paint(g); });
+  well.addEventListener('change', () => set([well.value], 'custom'));
+  custom.append(well, 'Custom color…');
+  const rule = document.createElement('div'); rule.className = 'sep';
+  menu.replaceChildren(
+    ...Object.entries(C).map(([n, h]) => item(n, () => set([h], n.toLowerCase()), h)),
+    rule, custom,
+    item('Gradient', () => { const p = PAIRS[pair++ % PAIRS.length]; set(p, 'gradient'); }),
+    item('No color', () => set(null, 'no'))
+  );
+  place(g);
+}
+function closeMenu(refocus = true) {
+  if (menu.hidden) return;
+  menu.hidden = true;
+  if (refocus && opened) opened.head.focus({ preventScroll: true });
+}
+document.addEventListener('pointerdown', e => { if (!menu.contains(e.target) && !e.target.closest('.head')) closeMenu(false); });
+list.addEventListener('scroll', () => closeMenu(false), { passive: true });
+menu.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { e.preventDefault(); return closeMenu(); }
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  e.preventDefault();
+  const items = [...menu.querySelectorAll('button:not([disabled]),input')];
+  const at = items.indexOf(document.activeElement);
+  items[(at + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length].focus();
+});
+$('clear').addEventListener('click', () => {
+  groups.forEach(g => { g.touched = true; g.hi = g.ink = null; paint(g); });
+  say.textContent = 'All clear. Right-click a group, or tap it on a phone.';
+});
+
+// The sidebar starts plain, then lights up one row at a time.
+groups.forEach((g, i) => setTimeout(() => {
+  if (g.touched) return;
+  g.hi = g.start.hi || null; g.ink = g.start.ink || null; paint(g);
+}, still ? 0 : 700 + i * 110));
+
+// The video runs only while on screen, and never with reduced motion.
+const films = document.querySelectorAll('video[data-play]');
+if (still) films.forEach(v => { v.controls = true; });
+else {
+  const watch = new IntersectionObserver(entries => entries.forEach(e => { if (e.isIntersecting) e.target.play().catch(() => {}); else e.target.pause(); }), { threshold: .15 });
+  films.forEach(v => watch.observe(v));
+}
+
+document.querySelectorAll('.copy').forEach(button => button.addEventListener('click', async () => {
+  const code = button.closest('.cmd').querySelector('code');
+  try { await navigator.clipboard.writeText(code.textContent); button.textContent = 'Copied'; }
+  catch { button.textContent = 'Press Ctrl+C'; getSelection().selectAllChildren(code); }
+  setTimeout(() => { button.textContent = 'Copy'; }, 1600);
+}));
+</script>
+</body>
+</html>
